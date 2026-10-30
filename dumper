@@ -1,0 +1,1030 @@
+--[[
+    DUMPER++ v2 "Overdrive"  |  Roblox deep dumper (Luau / executor)
+
+    Butuh   : executor dengan writefile / appendfile / makefolder.
+              Fungsi lain (getinstances, getgc, decompile, dst) opsional —
+              kalau tidak ada, fasenya dilewati otomatis.
+    Output  : workspace/DumpPP/<PlaceId>_<NamaGame>/<tanggal_jam>/
+    Isi     : manifest.json, _info.txt, _errors.txt, class_stats.txt,
+              instances.txt, nil_instances.txt, values.txt, attributes.txt,
+              tags.txt, scripts/, modules_return.txt, senv.txt,
+              gc_functions.txt, gc_tables.txt, remotes.txt,
+              remote_calls.txt (opsional, CaptureSeconds > 0)
+
+    Config tanpa edit file : getgenv().DumperPP_Config = { DecompileWorkers = 8, CaptureSeconds = 30 }
+    Stop darurat           : getgenv().DumperPP_Stop = true
+    Kalau nyangkut "masih jalan" : getgenv().DumperPP_Running = nil
+
+    Catatan : kode SERVER (ServerScriptService, ServerStorage, Script server) tidak
+              pernah dikirim ke client, jadi tidak bisa di-dump dari sisi client.
+]]
+
+local CFG = {
+    -- fitur
+    DecompileScripts = true,   -- decompile semua script (fallback: constants/protos)
+    DumpBytecode     = false,  -- simpan bytecode mentah tiap script (getscriptbytecode)
+    DumpModuleReturn = true,   -- isi return ModuleScript yang SUDAH ke-load
+    DumpSenv         = true,   -- environment (global/fungsi) script yang sedang jalan
+    DumpGC           = true,   -- scan garbage collector (fungsi + tabel sistem)
+    DumpRemotes      = true,   -- remote + handler client-nya
+    DumpTags         = true,   -- CollectionService tags
+    DumpValues       = true,   -- ValueBase (IntValue, StringValue, ...) + Attributes
+    DumpCore         = false,  -- ikutkan CoreGui/CorePackages (berisik)
+    CaptureSeconds   = 0,      -- >0 = log pasif panggilan remote (IN & OUT) selama N detik
+    SaveInstance     = false,  -- panggil saveinstance() bawaan executor di akhir
+
+    -- performa
+    DecompileWorkers = 4,      -- decompile paralel
+    ScriptTimeout    = 10,     -- detik per script saat decompile
+    RequireTimeout   = 3,      -- detik per module saat require
+    FrameBudget      = 0.012,  -- detik kerja per frame sebelum yield
+    MaxFileBytes     = 4 * 1024 * 1024, -- file dipecah jadi .partN kalau lewat ini
+
+    -- serializer
+    MaxDepth         = 5,
+    MaxTableKeys     = 200,
+    MaxStringLen     = 300,
+    MaxGCTables      = 500,
+    MaxFuncsPerOwner = 600,
+    MaxCaptured      = 20000,
+    GCKeywords       = {
+        "inventory", "damage", "cooldown", "stats", "config", "remote",
+        "network", "data", "state", "service", "controller", "manager",
+        "weapon", "item", "shop", "currency", "quest", "skill", "ability",
+    },
+}
+
+local VERSION = "2.0"
+
+---------------------------------------------------------------------
+-- env executor
+---------------------------------------------------------------------
+local ENV = (getgenv and getgenv()) or getfenv()
+do
+    local user = ENV.DumperPP_Config
+    if type(user) == "table" then
+        for k, v in next, user do CFG[k] = v end
+    end
+end
+
+local writefile, appendfile, makefolder = ENV.writefile, ENV.appendfile, ENV.makefolder
+if not (writefile and appendfile and makefolder) then
+    warn("[Dumper++] executor ini tidak punya writefile/appendfile/makefolder")
+    return
+end
+if ENV.DumperPP_Running then
+    warn("[Dumper++] masih jalan. Kalau nyangkut: getgenv().DumperPP_Running = nil")
+    return
+end
+ENV.DumperPP_Running = true
+ENV.DumperPP_Stop = false
+
+local cloneref          = ENV.cloneref or function(x) return x end
+local gethui            = ENV.gethui
+local decompile         = ENV.decompile
+local getinstances      = ENV.getinstances
+local getnilinstances   = ENV.getnilinstances
+local getscripts        = ENV.getscripts
+local getloadedmodules  = ENV.getloadedmodules
+local getscriptclosure  = ENV.getscriptclosure
+local getscripthash     = ENV.getscripthash
+local getscriptbytecode = ENV.getscriptbytecode
+local getgc             = ENV.getgc
+local getconnections    = ENV.getconnections
+local getcallbackvalue  = ENV.getcallbackvalue
+local getsenv           = ENV.getsenv
+local getrawmetatable   = ENV.getrawmetatable
+local islclosure        = ENV.islclosure
+local isexecutorclosure = ENV.isexecutorclosure or ENV.checkclosure
+local hookmetamethod    = ENV.hookmetamethod
+local getnamecallmethod = ENV.getnamecallmethod
+local setnamecallmethod = ENV.setnamecallmethod
+local checkcaller       = ENV.checkcaller
+local newcclosure       = ENV.newcclosure
+local saveinstance      = ENV.saveinstance
+local RENV              = ENV.getrenv and ENV.getrenv()
+
+local function svc(name)
+    local ok, s = pcall(function() return cloneref(game:GetService(name)) end)
+    return ok and s or nil
+end
+
+local HttpService   = svc("HttpService")
+local CoreGui       = svc("CoreGui")
+local CorePackages  = svc("CorePackages")
+
+-- tunggu game siap biar dump ga setengah-setengah
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+---------------------------------------------------------------------
+-- status GUI (nama acak, progress bar)
+---------------------------------------------------------------------
+local ui = {}
+local PHASE_TOTAL, phaseIdx, curBase = 9, 0, 0
+
+pcall(function()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = HttpService and HttpService:GenerateGUID(false) or "DumperPP"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 2147483647
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 360, 0, 40)
+    frame.Position = UDim2.new(0, 12, 1, -56)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, -16, 0, 22)
+    label.Position = UDim2.new(0, 8, 0, 2)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextColor3 = Color3.fromRGB(235, 235, 245)
+    label.Font = Enum.Font.Code
+    label.TextSize = 14
+    label.Text = "dumper++ v" .. VERSION .. " mulai..."
+    label.Parent = frame
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, -16, 0, 6)
+    bar.Position = UDim2.new(0, 8, 1, -10)
+    bar.BackgroundColor3 = Color3.fromRGB(45, 45, 58)
+    bar.BorderSizePixel = 0
+    bar.Parent = frame
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(90, 220, 140)
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+
+    ui.gui, ui.label, ui.fill = gui, label, fill
+    gui.Parent = (gethui and gethui()) or CoreGui
+end)
+
+local function status(text, frac, quiet)
+    if not quiet then print("[Dumper++] " .. text) end
+    if ui.label then ui.label.Text = text end
+    if frac and ui.fill then ui.fill.Size = UDim2.new(math.clamp(frac, 0, 1), 0, 1, 0) end
+end
+
+-- update progress di dalam fase (tanpa spam console)
+local function sub(frac, text)
+    status(text, curBase + frac / PHASE_TOTAL, true)
+end
+
+---------------------------------------------------------------------
+-- folder output (per-run, ga saling menimpa)
+---------------------------------------------------------------------
+local gname = "Game"
+pcall(function()
+    gname = svc("MarketplaceService"):GetProductInfo(game.PlaceId).Name
+end)
+gname = (tostring(gname):gsub("[^%w_%-]", "_")):sub(1, 40)
+
+local ROOT = ("DumpPP/%d_%s/%s"):format(game.PlaceId, gname, os.date("%Y%m%d_%H%M%S"))
+pcall(makefolder, "DumpPP")
+pcall(makefolder, ("DumpPP/%d_%s"):format(game.PlaceId, gname))
+pcall(makefolder, ROOT)
+pcall(makefolder, ROOT .. "/scripts")
+if CFG.DumpBytecode then pcall(makefolder, ROOT .. "/bytecode") end
+
+---------------------------------------------------------------------
+-- helper dasar
+---------------------------------------------------------------------
+local lastYield = os.clock()
+local function pace()
+    if ENV.DumperPP_Stop then error("dihentikan oleh user", 0) end
+    if os.clock() - lastYield > CFG.FrameBudget then
+        task.wait()
+        lastYield = os.clock()
+    end
+end
+
+local function each(list, fn)
+    for _, x in ipairs(list) do
+        pace()
+        pcall(fn, x)
+    end
+end
+
+local function clean(s)
+    return (tostring(s):gsub("%c", " "))
+end
+
+local function inGame(inst)
+    local ok, r = pcall(inst.IsDescendantOf, inst, game)
+    return ok and r == true
+end
+
+local function path(inst, intree)
+    local ok, p = pcall(inst.GetFullName, inst)
+    if not ok then return "<?>" end
+    if intree == nil then intree = inGame(inst) end
+    return (intree and "" or "[NIL] ") .. p
+end
+
+local function isCore(s)
+    local ok, r = pcall(function()
+        return (CoreGui and s:IsDescendantOf(CoreGui))
+            or (CorePackages and s:IsDescendantOf(CorePackages))
+    end)
+    return ok and r == true
+end
+
+-- owner fungsi -> path script (di-cache per script, bukan per fungsi)
+local ownerCache = setmetatable({}, { __mode = "k" })
+local function ownerOf(f)
+    local ok, s = pcall(function() return getfenv(f).script end)
+    if ok and typeof(s) == "Instance" then
+        local c = ownerCache[s]
+        if not c then
+            c = path(s)
+            ownerCache[s] = c
+        end
+        return c
+    end
+    return nil
+end
+
+local function fnDesc(f, noOwner)
+    local i = {}
+    if debug.getinfo then
+        local ok, r = pcall(debug.getinfo, f)
+        if ok and type(r) == "table" then i = r end
+    end
+    local va = (i.is_vararg == true or i.is_vararg == 1) and "+..." or ""
+    local desc = ("fn:%s line=%s params=%s%s upv=%s"):format(
+        tostring(i.name or "?"), tostring(i.linedefined or i.line or "?"),
+        tostring(i.numparams or "?"), va, tostring(i.nups or "?"))
+    if not noOwner then
+        desc = desc .. " owner=" .. (ownerOf(f) or tostring(i.short_src or i.source or "?"))
+    end
+    return desc
+end
+
+local function constSummary(f)
+    if not debug.getconstants then return "" end
+    local ok, c = pcall(debug.getconstants, f)
+    if not ok or type(c) ~= "table" then return "" end
+    local s = {}
+    for _, k in next, c do
+        if type(k) == "string" and #k > 2 and #k < 60 then
+            s[#s + 1] = clean(k)
+            if #s >= 16 then break end
+        end
+    end
+    return #s > 0 and ("  consts={" .. table.concat(s, ", ") .. "}") or ""
+end
+
+local function upvalSummary(f)
+    if not debug.getupvalues then return "" end
+    local ok, u = pcall(debug.getupvalues, f)
+    if not ok or type(u) ~= "table" then return "" end
+    local types, n = {}, 0
+    for _, v in next, u do
+        n += 1
+        if n <= 6 then types[n] = typeof(v) end
+    end
+    if n == 0 then return "" end
+    return "  upvals={" .. table.concat(types, ",") .. (n > 6 and ",..." or "") .. "}"
+end
+
+local function mtSummary(t)
+    if not getrawmetatable then return nil end
+    local ok, mt = pcall(getrawmetatable, t)
+    if not ok or type(mt) ~= "table" then return nil end
+    local keys = {}
+    pcall(function()
+        for k, v in next, mt do
+            keys[#keys + 1] = tostring(k) .. "=" .. typeof(v)
+            if #keys >= 12 then break end
+        end
+    end)
+    return "{" .. table.concat(keys, ", ") .. "}"
+end
+
+-- serializer: pakai `next` (bypass __pairs/__iter), tampilkan metatable
+local function ser(v, depth, seen, ind)
+    local t = typeof(v)
+    if t == "string" then
+        local s = clean(v:sub(1, CFG.MaxStringLen))
+        return '"' .. s .. (#v > CFG.MaxStringLen and '..."' or '"')
+    elseif t == "number" or t == "boolean" or t == "nil" then
+        return tostring(v)
+    elseif t == "Instance" then
+        local ok, cls = pcall(function() return v.ClassName end)
+        return ("Instance<%s> %s"):format(ok and cls or "?", path(v))
+    elseif t == "function" then
+        return fnDesc(v)
+    elseif t == "table" then
+        if seen[v] then return "<cycle>" end
+        if depth <= 0 then return "{...}" end
+        seen[v] = true
+        local out, n, cut = {}, 0, false
+        local mt = mtSummary(v)
+        if mt then out[#out + 1] = ind .. "  -- metatable: " .. mt end
+        pcall(function()
+            for k, val in next, v do
+                n += 1
+                if n > CFG.MaxTableKeys then
+                    cut = true
+                    break
+                end
+                out[#out + 1] = ("%s  [%s] = %s"):format(
+                    ind, ser(k, 0, seen, ""), ser(val, depth - 1, seen, ind .. "  "))
+            end
+        end)
+        seen[v] = nil
+        if #out == 0 then return "{}" end
+        if cut then out[#out + 1] = ind .. "  -- (dipotong)" end
+        return "{\n" .. table.concat(out, ",\n") .. "\n" .. ind .. "}"
+    end
+    local ok, s = pcall(tostring, v)
+    return ("%s(%s)"):format(t, clean(ok and s or "?"))
+end
+
+---------------------------------------------------------------------
+-- writer berbuffer + auto-split file besar + flush semua saat error
+---------------------------------------------------------------------
+local writers = {}
+local function newWriter(name, ext)
+    ext = ext or "txt"
+    local part, bytes, buf, n = 1, 0, {}, 0
+    local function fileName()
+        if part == 1 then return ("%s/%s.%s"):format(ROOT, name, ext) end
+        return ("%s/%s.part%d.%s"):format(ROOT, name, part, ext)
+    end
+    local current = fileName()
+    writefile(current, "")
+
+    local w = {}
+    local function flush()
+        if n > 0 then
+            appendfile(current, table.concat(buf, "\n", 1, n) .. "\n")
+            buf, n = {}, 0
+        end
+    end
+    function w.add(line)
+        n += 1
+        buf[n] = line
+        bytes += #line + 1
+        if n >= 300 then flush() end
+        if bytes >= CFG.MaxFileBytes then
+            flush()
+            part += 1
+            bytes = 0
+            current = fileName()
+            writefile(current, "")
+        end
+    end
+    w.close = flush
+    writers[#writers + 1] = w
+    return w
+end
+
+local function flushAll()
+    for _, w in ipairs(writers) do pcall(w.close) end
+end
+
+---------------------------------------------------------------------
+-- state bersama
+---------------------------------------------------------------------
+local errors, timings = {}, {}
+local scriptList, scriptSet, remotes = {}, {}, {}
+local loadedMods, loadedList = {}, {}
+local counts = {
+    tree = 0, nil_ = 0, values = 0, attrs = 0, tags = 0,
+    scripts = 0, dups = 0, modules = 0, senv = 0,
+    remotes = 0, gcFuncs = 0, gcTables = 0, captured = 0,
+}
+
+local function addScript(s)
+    if not scriptSet[s] then
+        scriptSet[s] = true
+        scriptList[#scriptList + 1] = s
+    end
+end
+
+local REMOTE_CLASSES = {
+    RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true,
+    BindableEvent = true, BindableFunction = true,
+}
+
+local function phase(name, enabled, fn)
+    phaseIdx += 1
+    if not enabled then return end
+    if ENV.DumperPP_Stop then return end
+    curBase = (phaseIdx - 1) / PHASE_TOTAL
+    status(name .. " ...", curBase)
+    local t0 = os.clock()
+    local ok, err = pcall(fn)
+    flushAll()
+    timings[name] = math.floor((os.clock() - t0) * 100) / 100
+    if not ok then
+        errors[#errors + 1] = name .. ": " .. tostring(err)
+        status(name .. " gagal (lihat _errors.txt)")
+    end
+end
+
+-- jalankan fungsi dengan timeout; thread yang kelamaan dibatalkan
+local function withTimeout(fn, timeout, ...)
+    local done, ok, res = false, false, nil
+    local args = table.pack(...)
+    local th = task.spawn(function()
+        ok, res = pcall(fn, table.unpack(args, 1, args.n))
+        done = true
+    end)
+    local t0 = os.clock()
+    while not done and os.clock() - t0 < timeout do task.wait() end
+    if not done then
+        pcall(task.cancel, th)
+        return false, "timeout"
+    end
+    return ok, res
+end
+
+-- fallback kalau decompile mati: constants + upvalue + proto (rekursif)
+local function closureReport(f, out, depth, ind)
+    if #out > 6000 then return end
+    out[#out + 1] = ind .. "-- " .. fnDesc(f, true) .. upvalSummary(f)
+    if debug.getconstants then
+        local ok, c = pcall(debug.getconstants, f)
+        if ok and type(c) == "table" then
+            for i, k in next, c do
+                local tk = type(k)
+                if tk == "string" then
+                    out[#out + 1] = ("%s-- k[%s] \"%s\""):format(ind, tostring(i), clean(k:sub(1, 120)))
+                elseif tk == "number" then
+                    out[#out + 1] = ("%s-- k[%s] %s"):format(ind, tostring(i), tostring(k))
+                end
+            end
+        end
+    end
+    if depth > 0 and debug.getprotos then
+        local ok, protos = pcall(debug.getprotos, f)
+        if ok and type(protos) == "table" then
+            for _, p in next, protos do
+                if type(p) == "function" then closureReport(p, out, depth - 1, ind .. "  ") end
+            end
+        end
+    end
+end
+
+local function fallbackBody(s)
+    if not getscriptclosure then
+        return "-- executor tidak punya decompile maupun getscriptclosure"
+    end
+    local ok, f = pcall(getscriptclosure, s)
+    if not ok or type(f) ~= "function" then return "-- getscriptclosure gagal" end
+    local out = { "-- [fallback] constants / upvalue / proto dari closure script" }
+    closureReport(f, out, 3, "")
+    return table.concat(out, "\n")
+end
+
+---------------------------------------------------------------------
+-- 1. semua instance (termasuk nil-parented) + values + attributes
+---------------------------------------------------------------------
+phase("instances", true, function()
+    local list
+    if getinstances then
+        list = getinstances()
+    else
+        list = game:GetDescendants()
+        if getnilinstances then
+            for _, i in ipairs(getnilinstances()) do list[#list + 1] = i end
+        end
+    end
+    local total = #list
+
+    local wTree = newWriter("instances")
+    local wNil = newWriter("nil_instances")
+    local wVals = CFG.DumpValues and newWriter("values") or nil
+    local wAttr = CFG.DumpValues and newWriter("attributes") or nil
+    local classCount = {}
+
+    local function handle(inst)
+        if inst == game then return end
+        if ui.gui and (inst == ui.gui or inst:IsDescendantOf(ui.gui)) then return end
+
+        local cls = inst.ClassName
+        local intree = inGame(inst)
+        local p = path(inst, intree)
+
+        local w = intree and wTree or wNil
+        w.add(("%-26s %s"):format(cls, p))
+        if intree then counts.tree += 1 else counts.nil_ += 1 end
+        classCount[cls] = (classCount[cls] or 0) + 1
+
+        if inst:IsA("LuaSourceContainer") then addScript(inst) end
+        if REMOTE_CLASSES[cls] then remotes[#remotes + 1] = inst end
+
+        if wVals then
+            if inst:IsA("ValueBase") then
+                local okv, val = pcall(function() return inst.Value end)
+                wVals.add(("%-14s %s = %s"):format(cls, p, okv and ser(val, 2, {}, "") or "<?>"))
+                counts.values += 1
+            end
+            local oka, attrs = pcall(inst.GetAttributes, inst)
+            if oka and type(attrs) == "table" and next(attrs) ~= nil then
+                wAttr.add(p)
+                for k, val in next, attrs do
+                    wAttr.add(("    %s = %s"):format(tostring(k), ser(val, 2, {}, "    ")))
+                end
+                counts.attrs += 1
+            end
+        end
+    end
+
+    for i, inst in ipairs(list) do
+        pace()
+        pcall(handle, inst)
+        if i % 2000 == 0 then
+            sub(i / total, ("instances %d/%d"):format(i, total))
+        end
+    end
+
+    local rows = {}
+    for cls, n in next, classCount do rows[#rows + 1] = { cls, n } end
+    table.sort(rows, function(a, b) return a[2] > b[2] end)
+    local wc = newWriter("class_stats")
+    for _, r in ipairs(rows) do wc.add(("%8d  %s"):format(r[2], r[1])) end
+end)
+
+---------------------------------------------------------------------
+-- 2. CollectionService tags
+---------------------------------------------------------------------
+phase("tags", CFG.DumpTags, function()
+    local CS = svc("CollectionService")
+    local w = newWriter("tags")
+    for _, tag in ipairs(CS:GetAllTags()) do
+        pace()
+        local items = CS:GetTagged(tag)
+        w.add(("## %s (%d)"):format(tag, #items))
+        for i, inst in ipairs(items) do
+            if i > 50 then
+                w.add("  ...")
+                break
+            end
+            w.add("  " .. path(inst))
+        end
+        counts.tags += 1
+    end
+end)
+
+---------------------------------------------------------------------
+-- 3. script + module: decompile paralel, dedup by hash
+---------------------------------------------------------------------
+phase("scripts", true, function()
+    if getscripts then
+        for _, s in ipairs(getscripts()) do addScript(s) end
+    end
+    if getloadedmodules then
+        for _, m in ipairs(getloadedmodules()) do
+            loadedMods[m] = true
+            loadedList[#loadedList + 1] = m
+            addScript(m)
+        end
+    end
+
+    -- pass 1: metadata + deteksi duplikat (script identik cuma di-decompile sekali)
+    local meta, jobs, primaryOf = {}, {}, {}
+    for _, s in ipairs(scriptList) do
+        pace()
+        if CFG.DumpCore or not isCore(s) then
+            local i = #meta + 1
+            local p = path(s)
+            local hash
+            if getscripthash then
+                local ok, h = pcall(getscripthash, s)
+                if ok and h then hash = tostring(h) end
+            end
+            local fname = ("%04d_%s.lua"):format(i, (p:gsub("[^%w_%.%-]", "_")):sub(-90))
+            local m = { s = s, p = p, hash = hash, fname = fname, cls = s.ClassName }
+            meta[i] = m
+            local primary = hash and primaryOf[hash]
+            if primary then
+                m.dupOf = primary
+                primary.copies = (primary.copies or 1) + 1
+                counts.dups += 1
+            else
+                if hash then primaryOf[hash] = m end
+                jobs[#jobs + 1] = m
+            end
+        end
+    end
+
+    local function process(m)
+        local s = m.s
+        local body
+        if CFG.DecompileScripts and decompile then
+            local ok, r = withTimeout(decompile, CFG.ScriptTimeout, s)
+            if ok and type(r) == "string" and #r > 0 then
+                body = r
+            else
+                body = "-- decompile gagal: " .. tostring(ok and "hasil kosong" or r)
+                    .. "\n" .. fallbackBody(s)
+            end
+        else
+            body = fallbackBody(s)
+        end
+
+        local extra = ""
+        pcall(function()
+            if s:IsA("BaseScript") then
+                extra = ("-- Enabled   : %s\n-- RunContext: %s\n"):format(
+                    tostring(s.Enabled), tostring(s.RunContext))
+            end
+        end)
+
+        local header = ("-- Path      : %s\n-- Class     : %s\n-- Hash      : %s\n-- Loaded    : %s\n-- Copies    : %d\n%s\n"):format(
+            m.p, m.cls, m.hash or "?", tostring(loadedMods[s] == true), m.copies or 1, extra)
+        writefile(ROOT .. "/scripts/" .. m.fname, header .. body)
+
+        if CFG.DumpBytecode and getscriptbytecode then
+            local okb, bc = pcall(getscriptbytecode, s)
+            if okb and type(bc) == "string" then
+                local bname = (m.fname:gsub("%.lua$", ".bin"))
+                pcall(writefile, ROOT .. "/bytecode/" .. bname, bc)
+            end
+        end
+    end
+
+    -- pass 2: worker pool
+    local N = math.max(1, CFG.DecompileWorkers)
+    local nextJob, finished, workersDone = 1, 0, 0
+    local totalJobs = #jobs
+
+    local function worker()
+        while true do
+            pace()
+            local i = nextJob
+            if i > totalJobs then return end
+            nextJob = i + 1
+            local job = jobs[i]
+            local ok, err = pcall(process, job)
+            if ok then
+                counts.scripts += 1
+            else
+                errors[#errors + 1] = ("script %s: %s"):format(job.p, tostring(err))
+            end
+            finished += 1
+            if finished % 5 == 0 then
+                sub(finished / totalJobs, ("scripts %d/%d (dup dilewati: %d)"):format(
+                    finished, totalJobs, counts.dups))
+            end
+        end
+    end
+
+    for _ = 1, N do
+        task.spawn(function()
+            pcall(worker)
+            workersDone += 1
+        end)
+    end
+    while workersDone < N do task.wait(0.1) end
+
+    local idx = newWriter("scripts/_index")
+    for _, m in ipairs(meta) do
+        local where = m.dupOf and ("dup -> " .. m.dupOf.fname) or m.fname
+        idx.add(("%s | %s | %s | %s"):format(where, m.cls, m.p, m.hash or "?"))
+    end
+end)
+
+---------------------------------------------------------------------
+-- 4. return ModuleScript yang sudah ke-load (dengan timeout)
+---------------------------------------------------------------------
+phase("modules_return", CFG.DumpModuleReturn and getloadedmodules, function()
+    local w = newWriter("modules_return")
+    each(loadedList, function(m)
+        if CFG.DumpCore or not isCore(m) then
+            local ok, ret = withTimeout(require, CFG.RequireTimeout, m)
+            w.add("=== " .. path(m))
+            w.add(ok and ser(ret, CFG.MaxDepth, {}, "") or ("<require gagal: " .. tostring(ret) .. ">"))
+            w.add("")
+            counts.modules += 1
+        end
+    end)
+end)
+
+---------------------------------------------------------------------
+-- 5. environment script yang sedang jalan (getsenv)
+---------------------------------------------------------------------
+phase("senv", CFG.DumpSenv and getsenv, function()
+    local w = newWriter("senv")
+    each(scriptList, function(s)
+        if (s:IsA("LocalScript") or loadedMods[s]) and (CFG.DumpCore or not isCore(s)) then
+            local ok, env = pcall(getsenv, s)
+            if ok and type(env) == "table" and next(env) ~= nil then
+                w.add("=== " .. path(s))
+                w.add(ser(env, 2, {}, ""))
+                w.add("")
+                counts.senv += 1
+            end
+        end
+    end)
+end)
+
+---------------------------------------------------------------------
+-- 6. garbage collector: fungsi game + tabel "sistem"
+---------------------------------------------------------------------
+phase("gc", CFG.DumpGC and getgc, function()
+    local gc = getgc(true)
+    local isL = islclosure or function() return true end
+    local isExec = isexecutorclosure or function() return false end
+
+    -- tabel milik dumper sendiri jangan ikut kebaca
+    local ignore = {}
+    local function ig(t) if type(t) == "table" then ignore[t] = true end end
+    for _, t in ipairs({ CFG, CFG.GCKeywords, scriptList, scriptSet, remotes, loadedMods, loadedList,
+        counts, errors, timings, REMOTE_CLASSES, ownerCache, writers, ENV, _G, shared, RENV, gc }) do
+        ig(t)
+    end
+
+    local function scoreTable(tbl)
+        local nk, nf, kw = 0, 0, 0
+        local ok = pcall(function()
+            for k, val in next, tbl do
+                nk += 1
+                if type(val) == "function" then nf += 1 end
+                if type(k) == "string" then
+                    local lk = k:lower()
+                    for _, word in ipairs(CFG.GCKeywords) do
+                        if lk:find(word, 1, true) then
+                            kw += 1
+                            break
+                        end
+                    end
+                end
+                if nk > 400 then break end
+            end
+        end)
+        if not ok then return 0, 0 end
+        return nk, nf * 2 + kw * 5
+    end
+
+    local byOwner, ownerKeys, cands = {}, {}, {}
+    local total = #gc
+
+    for i, v in ipairs(gc) do
+        pace()
+        local t = type(v)
+        if t == "function" then
+            if isL(v) and not isExec(v) then
+                local owner = ownerOf(v) or "<unknown>"
+                local core = owner:find("^CoreGui") or owner:find("^CorePackages")
+                    or owner:find("^%[NIL%] CoreGui") or owner:find("^%[NIL%] CorePackages")
+                if CFG.DumpCore or not core then
+                    local bucket = byOwner[owner]
+                    if not bucket then
+                        bucket = {}
+                        byOwner[owner] = bucket
+                        ownerKeys[#ownerKeys + 1] = owner
+                    end
+                    bucket[#bucket + 1] = v -- simpan referensi, string dibuat belakangan
+                end
+            end
+        elseif t == "table" and not ignore[v] then
+            local nk, score = scoreTable(v)
+            if nk >= 3 and score > 0 then
+                cands[#cands + 1] = { tbl = v, score = score, nk = nk }
+                if #cands > CFG.MaxGCTables * 4 then
+                    table.sort(cands, function(a, b) return a.score > b.score end)
+                    for j = #cands, CFG.MaxGCTables + 1, -1 do cands[j] = nil end
+                end
+            end
+        end
+        if i % 5000 == 0 then sub(i / total * 0.7, ("gc scan %d/%d"):format(i, total)) end
+    end
+
+    table.sort(ownerKeys)
+    local fw = newWriter("gc_functions")
+    for oi, owner in ipairs(ownerKeys) do
+        pace()
+        local b = byOwner[owner]
+        fw.add(("## %s (%d fungsi)"):format(owner, #b))
+        for j, f in ipairs(b) do
+            if j > CFG.MaxFuncsPerOwner then
+                fw.add(("  ... (+%d lagi)"):format(#b - j + 1))
+                break
+            end
+            fw.add("  " .. fnDesc(f, true) .. constSummary(f) .. upvalSummary(f))
+        end
+        counts.gcFuncs += #b
+        byOwner[owner] = nil
+        if oi % 20 == 0 then sub(0.7 + 0.2 * oi / #ownerKeys, "gc tulis fungsi") end
+    end
+    fw.close()
+
+    table.sort(cands, function(a, b) return a.score > b.score end)
+    local tw = newWriter("gc_tables")
+    for i = 1, math.min(#cands, CFG.MaxGCTables) do
+        pace()
+        local c = cands[i]
+        tw.add(("=== tabel #%d  (keys=%d score=%d)"):format(i, c.nk, c.score))
+        tw.add(ser(c.tbl, 3, {}, ""))
+        tw.add("")
+        counts.gcTables += 1
+    end
+end)
+
+---------------------------------------------------------------------
+-- 7. remote + handler client-nya (lengkap dengan const & upvalue handler)
+---------------------------------------------------------------------
+phase("remotes", CFG.DumpRemotes, function()
+    local w = newWriter("remotes")
+    each(remotes, function(r)
+        local cls = r.ClassName
+        w.add(("[%s] %s"):format(cls, path(r)))
+        counts.remotes += 1
+
+        if getconnections then
+            local sig
+            if cls == "RemoteEvent" or cls == "UnreliableRemoteEvent" then
+                sig = r.OnClientEvent
+            elseif cls == "BindableEvent" then
+                sig = r.Event
+            end
+            if sig then
+                local ok, conns = pcall(getconnections, sig)
+                if ok and type(conns) == "table" then
+                    for _, c in ipairs(conns) do
+                        local okf, fn = pcall(function() return c.Function end)
+                        if okf and type(fn) == "function" then
+                            w.add("    handler: " .. fnDesc(fn) .. constSummary(fn) .. upvalSummary(fn))
+                        else
+                            w.add("    handler: <foreign/C>")
+                        end
+                    end
+                end
+            end
+        end
+
+        if cls == "RemoteFunction" and getcallbackvalue then
+            local ok, cb = pcall(getcallbackvalue, r, "OnClientInvoke")
+            if ok and type(cb) == "function" then
+                w.add("    OnClientInvoke: " .. fnDesc(cb) .. constSummary(cb) .. upvalSummary(cb))
+            end
+        end
+    end)
+end)
+
+---------------------------------------------------------------------
+-- 8. capture pasif panggilan remote (IN lewat OnClientEvent, OUT lewat __namecall)
+--    Cuma MENCATAT. Hook tetap terpasang sebagai passthrough setelah selesai.
+---------------------------------------------------------------------
+phase("capture", CFG.CaptureSeconds > 0, function()
+    local w = newWriter("remote_calls")
+    local log, n, capturing = {}, 0, true
+    local conns = {}
+    local t0 = os.clock()
+
+    for _, r in ipairs(remotes) do
+        local cls = r.ClassName
+        if cls == "RemoteEvent" or cls == "UnreliableRemoteEvent" then
+            local okc, c = pcall(function()
+                return r.OnClientEvent:Connect(function(...)
+                    if capturing and n < CFG.MaxCaptured then
+                        n += 1
+                        log[n] = { dir = "IN ", m = "OnClientEvent", inst = r, args = table.pack(...), t = os.clock() }
+                    end
+                end)
+            end)
+            if okc and c then conns[#conns + 1] = c end
+        end
+    end
+
+    local hookOK = false
+    if hookmetamethod and getnamecallmethod then
+        local SEND = { FireServer = true, InvokeServer = true, fireServer = true, invokeServer = true }
+        local wrap = newcclosure or function(f) return f end
+        local old
+        local okh = pcall(function()
+            old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
+                local m = getnamecallmethod()
+                -- di dalam hook: kerja minimal, serialisasi dilakukan nanti
+                if capturing and SEND[m] and n < CFG.MaxCaptured and typeof(self) == "Instance"
+                    and not (checkcaller and checkcaller()) then
+                    n += 1
+                    log[n] = { dir = "OUT", m = m, inst = self, args = table.pack(...), t = os.clock() }
+                end
+                if setnamecallmethod then setnamecallmethod(m) end
+                return old(self, ...)
+            end))
+        end)
+        hookOK = okh and old ~= nil
+    end
+
+    local total = CFG.CaptureSeconds
+    while os.clock() - t0 < total do
+        if ENV.DumperPP_Stop then break end
+        local left = math.max(0, math.floor(total - (os.clock() - t0)))
+        sub((os.clock() - t0) / total, ("capture %ds lagi | %d panggilan"):format(left, n))
+        task.wait(0.25)
+    end
+    capturing = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+
+    if not hookOK then w.add("-- hookmetamethod/getnamecallmethod tidak tersedia: hanya capture IN") end
+    for _, e in ipairs(log) do
+        pace()
+        w.add(("[%s] %-12s %s  (+%.2fs)"):format(e.dir, e.m, path(e.inst), e.t - t0))
+        for i = 1, e.args.n do
+            w.add(("    arg%d = %s"):format(i, ser(e.args[i], 3, {}, "    ")))
+        end
+    end
+    counts.captured = n
+end)
+
+---------------------------------------------------------------------
+-- 9. saveinstance bawaan executor (opsi beda-beda tiap executor)
+---------------------------------------------------------------------
+phase("saveinstance", CFG.SaveInstance and saveinstance, function()
+    saveinstance({ FileName = "DumpPP_" .. gname, NilInstances = true, DecompileScripts = true })
+end)
+
+---------------------------------------------------------------------
+-- info + manifest + error log
+---------------------------------------------------------------------
+local want = {
+    "getinstances", "getnilinstances", "getscripts", "getloadedmodules", "decompile",
+    "getscriptclosure", "getscripthash", "getscriptbytecode", "getgc", "getconnections",
+    "getcallbackvalue", "getsenv", "getrawmetatable", "islclosure", "isexecutorclosure",
+    "hookmetamethod", "getnamecallmethod", "cloneref", "gethui", "saveinstance",
+}
+local caps, capMap = {}, {}
+for _, n in ipairs(want) do
+    local has = ENV[n] ~= nil
+    capMap[n] = has
+    caps[#caps + 1] = ("  %-18s %s"):format(n, has and "ada" or "TIDAK ADA")
+end
+
+local execName = "?"
+if ENV.identifyexecutor then
+    local ok, n = pcall(ENV.identifyexecutor)
+    if ok then execName = tostring(n) end
+end
+
+local info = {
+    "Dumper++ : v" .. VERSION,
+    "PlaceId  : " .. tostring(game.PlaceId),
+    "GameId   : " .. tostring(game.GameId),
+    "JobId    : " .. tostring(game.JobId),
+    "Versi    : " .. tostring(game.PlaceVersion),
+    "Game     : " .. gname,
+    "Waktu    : " .. os.date("%Y-%m-%d %H:%M:%S"),
+    "Executor : " .. execName,
+    "",
+    ("instance di tree : %d"):format(counts.tree),
+    ("instance NIL     : %d"):format(counts.nil_),
+    ("value objects    : %d"):format(counts.values),
+    ("instance attr    : %d"):format(counts.attrs),
+    ("tags             : %d"):format(counts.tags),
+    ("script ditulis   : %d"):format(counts.scripts),
+    ("script duplikat  : %d (dilewati, sama hash)"):format(counts.dups),
+    ("module di-dump   : %d"):format(counts.modules),
+    ("senv di-dump     : %d"):format(counts.senv),
+    ("remote           : %d"):format(counts.remotes),
+    ("fungsi GC        : %d"):format(counts.gcFuncs),
+    ("tabel GC         : %d"):format(counts.gcTables),
+    ("remote captured  : %d"):format(counts.captured),
+    "",
+    "Durasi fase (detik):",
+}
+for name, t in next, timings do info[#info + 1] = ("  %-16s %s"):format(name, tostring(t)) end
+info[#info + 1] = ""
+info[#info + 1] = "Kemampuan executor:"
+info[#info + 1] = table.concat(caps, "\n")
+writefile(ROOT .. "/_info.txt", table.concat(info, "\n"))
+
+if HttpService then
+    pcall(function()
+        writefile(ROOT .. "/manifest.json", HttpService:JSONEncode({
+            version = VERSION,
+            placeId = game.PlaceId,
+            gameId = game.GameId,
+            placeVersion = game.PlaceVersion,
+            game = gname,
+            executor = execName,
+            counts = counts,
+            timings = timings,
+            capabilities = capMap,
+            errors = errors,
+        }))
+    end)
+end
+
+if #errors > 0 then
+    writefile(ROOT .. "/_errors.txt", table.concat(errors, "\n"))
+end
+
+status("selesai -> workspace/" .. ROOT, 1)
+if ENV.setclipboard then pcall(ENV.setclipboard, "workspace/" .. ROOT) end
+ENV.DumperPP_Running = nil
+task.delay(8, function()
+    if ui.gui then pcall(function() ui.gui:Destroy() end) end
+end)

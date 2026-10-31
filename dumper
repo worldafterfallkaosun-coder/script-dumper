@@ -1,371 +1,407 @@
 --[[
-    DUMPER++ v2 "Overdrive"  |  Roblox deep dumper (Luau / executor)
+    DUMPER++ v3 "Atlas"  |  Roblox universal dumper + live monitor (Luau / executor)
 
-    Butuh   : executor dengan writefile / appendfile / makefolder.
-              Fungsi lain (getinstances, getgc, decompile, dst) opsional —
-              kalau tidak ada, fasenya dilewati otomatis.
-    Output  : workspace/DumpPP/<PlaceId>_<NamaGame>/<tanggal_jam>/
-    Isi     : manifest.json, _info.txt, _errors.txt, class_stats.txt,
-              instances.txt, nil_instances.txt, values.txt, attributes.txt,
-              tags.txt, scripts/, modules_return.txt, senv.txt,
-              gc_functions.txt, gc_tables.txt, remotes.txt,
-              remote_calls.txt (opsional, CaptureSeconds > 0)
+    Alur    : load -> SCAN sistem di map -> UI dibangun dari hasil scan -> pilih sistem & modul -> Dump / Live
+    Butuh   : executor dengan writefile / appendfile / makefolder untuk simpan file.
+              Tanpa itu scan + UI + live tetap jalan, hanya tidak bisa menyimpan.
+              Fungsi lain (getgc, decompile, hookmetamethod, dst) opsional:
+              fitur yang tidak didukung otomatis redup / dilewati.
+    Output  : workspace/DumpPP/<PlaceId>_<Game>/<tanggal_jam>/
+                dump : manifest.json, _info.txt, _session.log, instances.txt, values.txt, attributes.txt,
+                       tags.txt, scripts/, modules_return.txt, senv.txt, gc_functions.txt, gc_tables.txt, remotes.txt
+                live : live/events.log + live/events.jsonl  (ditulis terus-menerus saat Live aktif)
+    Setting : workspace/DumpPP/settings.json (tersimpan otomatis dari toggle UI)
+    Hotkey  : RightControl = sembunyi / tampilkan UI
+    API     : getgenv().DumperPP = { Scan(), Dump(), LiveStart(), LiveStop(), Stop(), Destroy() }
+    Config  : getgenv().DumperPP_Config = { DecompileWorkers = 8 }   -- diisi SEBELUM execute
+    Re-run  : execute ulang otomatis membersihkan instance lama (tidak ada lagi "masih jalan").
 
-    Config tanpa edit file : getgenv().DumperPP_Config = { DecompileWorkers = 8, CaptureSeconds = 30 }
-    Stop darurat           : getgenv().DumperPP_Stop = true
-    Kalau nyangkut "masih jalan" : getgenv().DumperPP_Running = nil
-
-    Catatan : kode SERVER (ServerScriptService, ServerStorage, Script server) tidak
-              pernah dikirim ke client, jadi tidak bisa di-dump dari sisi client.
+    Catatan : kode SERVER (ServerScriptService, ServerStorage, Script server) tidak pernah dikirim
+              ke client, jadi tidak bisa di-dump dari sisi client. Map dengan StreamingEnabled hanya
+              menampilkan instance yang sedang ter-stream (scan akan memberi peringatan).
 ]]
 
-local CFG = {
-    -- fitur
-    DecompileScripts = true,   -- decompile semua script (fallback: constants/protos)
-    DumpBytecode     = false,  -- simpan bytecode mentah tiap script (getscriptbytecode)
-    DumpModuleReturn = true,   -- isi return ModuleScript yang SUDAH ke-load
-    DumpSenv         = true,   -- environment (global/fungsi) script yang sedang jalan
-    DumpGC           = true,   -- scan garbage collector (fungsi + tabel sistem)
-    DumpRemotes      = true,   -- remote + handler client-nya
-    DumpTags         = true,   -- CollectionService tags
-    DumpValues       = true,   -- ValueBase (IntValue, StringValue, ...) + Attributes
-    DumpCore         = false,  -- ikutkan CoreGui/CorePackages (berisik)
-    CaptureSeconds   = 0,      -- >0 = log pasif panggilan remote (IN & OUT) selama N detik
-    SaveInstance     = false,  -- panggil saveinstance() bawaan executor di akhir
-
-    -- performa
-    DecompileWorkers = 4,      -- decompile paralel
-    ScriptTimeout    = 10,     -- detik per script saat decompile
-    RequireTimeout   = 3,      -- detik per module saat require
-    FrameBudget      = 0.012,  -- detik kerja per frame sebelum yield
-    MaxFileBytes     = 4 * 1024 * 1024, -- file dipecah jadi .partN kalau lewat ini
-
-    -- serializer
-    MaxDepth         = 5,
-    MaxTableKeys     = 200,
-    MaxStringLen     = 300,
-    MaxGCTables      = 500,
-    MaxFuncsPerOwner = 600,
-    MaxCaptured      = 20000,
-    GCKeywords       = {
-        "inventory", "damage", "cooldown", "stats", "config", "remote",
-        "network", "data", "state", "service", "controller", "manager",
-        "weapon", "item", "shop", "currency", "quest", "skill", "ability",
-    },
-}
-
-local VERSION = "2.0"
-
----------------------------------------------------------------------
--- env executor
----------------------------------------------------------------------
+local VERSION = "3.0"
 local ENV = (getgenv and getgenv()) or getfenv()
-do
-    local user = ENV.DumperPP_Config
-    if type(user) == "table" then
-        for k, v in next, user do CFG[k] = v end
-    end
+
+if type(ENV.DumperPP) == "table" and type(ENV.DumperPP.Destroy) == "function" then
+    pcall(ENV.DumperPP.Destroy)
 end
 
-local writefile, appendfile, makefolder = ENV.writefile, ENV.appendfile, ENV.makefolder
-if not (writefile and appendfile and makefolder) then
-    warn("[Dumper++] executor ini tidak punya writefile/appendfile/makefolder")
-    return
+local APP = { cleanups = {}, cancel = false, dead = false }
+ENV.DumperPP = APP
+local function onCleanup(f) APP.cleanups[#APP.cleanups + 1] = f end
+function APP.Destroy()
+    APP.dead, APP.cancel = true, true
+    ENV.DumperPP_Sink = nil
+    for i = #APP.cleanups, 1, -1 do pcall(APP.cleanups[i]) end
+    if ENV.DumperPP == APP then ENV.DumperPP = nil end
 end
-if ENV.DumperPP_Running then
-    warn("[Dumper++] masih jalan. Kalau nyangkut: getgenv().DumperPP_Running = nil")
-    return
-end
-ENV.DumperPP_Running = true
-ENV.DumperPP_Stop = false
+function APP.Stop() APP.cancel = true end
 
-local cloneref          = ENV.cloneref or function(x) return x end
-local gethui            = ENV.gethui
-local decompile         = ENV.decompile
-local getinstances      = ENV.getinstances
-local getnilinstances   = ENV.getnilinstances
-local getscripts        = ENV.getscripts
-local getloadedmodules  = ENV.getloadedmodules
-local getscriptclosure  = ENV.getscriptclosure
-local getscripthash     = ENV.getscripthash
-local getscriptbytecode = ENV.getscriptbytecode
-local getgc             = ENV.getgc
-local getconnections    = ENV.getconnections
-local getcallbackvalue  = ENV.getcallbackvalue
-local getsenv           = ENV.getsenv
-local getrawmetatable   = ENV.getrawmetatable
-local islclosure        = ENV.islclosure
-local isexecutorclosure = ENV.isexecutorclosure or ENV.checkclosure
-local hookmetamethod    = ENV.hookmetamethod
-local getnamecallmethod = ENV.getnamecallmethod
-local setnamecallmethod = ENV.setnamecallmethod
-local checkcaller       = ENV.checkcaller
-local newcclosure       = ENV.newcclosure
-local saveinstance      = ENV.saveinstance
-local RENV              = ENV.getrenv and ENV.getrenv()
+---------------------------------------------------------------------
+-- 0. kemampuan executor, service, konfigurasi
+---------------------------------------------------------------------
+local CAPLIST = {
+    "writefile", "appendfile", "makefolder", "readfile", "isfile", "decompile", "getinstances",
+    "getnilinstances", "getscripts", "getloadedmodules", "getscriptclosure", "getscripthash",
+    "getscriptbytecode", "getgc", "getconnections", "getcallbackvalue", "getsenv", "getrawmetatable",
+    "islclosure", "isexecutorclosure", "hookmetamethod", "getnamecallmethod", "setnamecallmethod",
+    "checkcaller", "newcclosure", "saveinstance", "setclipboard", "gethui", "identifyexecutor",
+}
+local CAP = {}
+for _, n in ipairs(CAPLIST) do CAP[n] = ENV[n] end
+CAP.isexecutorclosure = CAP.isexecutorclosure or ENV.checkclosure
+
+local cloneref = ENV.cloneref or function(x) return x end
+local CAN_WRITE = (CAP.writefile and CAP.appendfile and CAP.makefolder) and true or false
+local RENV = ENV.getrenv and ENV.getrenv()
 
 local function svc(name)
     local ok, s = pcall(function() return cloneref(game:GetService(name)) end)
     return ok and s or nil
 end
+local HttpService, CoreGui, CorePackages = svc("HttpService"), svc("CoreGui"), svc("CorePackages")
+local Players, UIS = svc("Players"), svc("UserInputService")
 
-local HttpService   = svc("HttpService")
-local CoreGui       = svc("CoreGui")
-local CorePackages  = svc("CorePackages")
-
--- tunggu game siap biar dump ga setengah-setengah
 if not game:IsLoaded() then game.Loaded:Wait() end
 
----------------------------------------------------------------------
--- status GUI (nama acak, progress bar)
----------------------------------------------------------------------
-local ui = {}
-local PHASE_TOTAL, phaseIdx, curBase = 9, 0, 0
+local CFG = {
+    Modules = {
+        instances = true, tags = true, scripts = true, modules_return = true,
+        senv = true, gc = true, remotes = true, saveinstance = false,
+    },
+    Live = { remotes = true, values = true, instances = false },
 
-pcall(function()
-    local gui = Instance.new("ScreenGui")
-    gui.Name = HttpService and HttpService:GenerateGUID(false) or "DumperPP"
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 2147483647
+    DecompileScripts = true,   -- decompile semua script (fallback: constants/protos)
+    DumpBytecode     = false,  -- bytecode mentah tiap script
+    DumpCore         = false,  -- ikutkan CoreGui/CorePackages (berisik)
 
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 360, 0, 40)
-    frame.Position = UDim2.new(0, 12, 1, -56)
-    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
-    frame.BorderSizePixel = 0
-    frame.Parent = gui
+    DecompileWorkers = 4,
+    ScriptTimeout    = 10,
+    RequireTimeout   = 3,
+    FrameBudget      = 0.012,
+    MaxFileBytes     = 4 * 1024 * 1024,
 
-    local corner = Instance.new("UICorner")
-    corner.Parent = frame
+    MaxDepth         = 5,
+    MaxTableKeys     = 200,
+    MaxStringLen     = 300,
+    MaxGCTables      = 500,
+    MaxFuncsPerOwner = 600,
+    GCKeywords       = {
+        "inventory", "damage", "cooldown", "stats", "config", "remote", "network", "data", "state",
+        "service", "controller", "manager", "weapon", "item", "shop", "currency", "quest", "skill", "ability",
+    },
 
-    local label = Instance.new("TextLabel")
-    label.BackgroundTransparency = 1
-    label.Size = UDim2.new(1, -16, 0, 22)
-    label.Position = UDim2.new(0, 8, 0, 2)
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextColor3 = Color3.fromRGB(235, 235, 245)
-    label.Font = Enum.Font.Code
-    label.TextSize = 14
-    label.Text = "dumper++ v" .. VERSION .. " mulai..."
-    label.Parent = frame
+    -- live
+    LiveMaxWatch        = 1500,  -- maks value/attribute yang diawasi
+    LiveSpamPerSec      = 40,    -- >N event/detik dari satu sumber = auto-mute
+    LiveFlushSec        = 1,     -- interval flush log ke file
+    LiveJSONL           = true,  -- tulis events.jsonl (satu JSON per baris)
+    LiveArgDepth        = 3,
+    LiveQueueMax        = 6000,
+    LiveIncludeExecutor = false, -- ikutkan remote yang dipanggil oleh executor sendiri
 
-    local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(1, -16, 0, 6)
-    bar.Position = UDim2.new(0, 8, 1, -10)
-    bar.BackgroundColor3 = Color3.fromRGB(45, 45, 58)
-    bar.BorderSizePixel = 0
-    bar.Parent = frame
+    UIKey     = "RightControl",
+    UIMaxRows = 120,
+}
 
-    local fill = Instance.new("Frame")
-    fill.Size = UDim2.new(0, 0, 1, 0)
-    fill.BackgroundColor3 = Color3.fromRGB(90, 220, 140)
-    fill.BorderSizePixel = 0
-    fill.Parent = bar
-
-    ui.gui, ui.label, ui.fill = gui, label, fill
-    gui.Parent = (gethui and gethui()) or CoreGui
-end)
-
-local function status(text, frac, quiet)
-    if not quiet then print("[Dumper++] " .. text) end
-    if ui.label then ui.label.Text = text end
-    if frac and ui.fill then ui.fill.Size = UDim2.new(math.clamp(frac, 0, 1), 0, 1, 0) end
-end
-
--- update progress di dalam fase (tanpa spam console)
-local function sub(frac, text)
-    status(text, curBase + frac / PHASE_TOTAL, true)
-end
-
----------------------------------------------------------------------
--- folder output (per-run, ga saling menimpa)
----------------------------------------------------------------------
-local gname = "Game"
-pcall(function()
-    gname = svc("MarketplaceService"):GetProductInfo(game.PlaceId).Name
-end)
-gname = (tostring(gname):gsub("[^%w_%-]", "_")):sub(1, 40)
-
-local ROOT = ("DumpPP/%d_%s/%s"):format(game.PlaceId, gname, os.date("%Y%m%d_%H%M%S"))
-pcall(makefolder, "DumpPP")
-pcall(makefolder, ("DumpPP/%d_%s"):format(game.PlaceId, gname))
-pcall(makefolder, ROOT)
-pcall(makefolder, ROOT .. "/scripts")
-if CFG.DumpBytecode then pcall(makefolder, ROOT .. "/bytecode") end
-
----------------------------------------------------------------------
--- helper dasar
----------------------------------------------------------------------
-local lastYield = os.clock()
-local function pace()
-    if ENV.DumperPP_Stop then error("dihentikan oleh user", 0) end
-    if os.clock() - lastYield > CFG.FrameBudget then
-        task.wait()
-        lastYield = os.clock()
-    end
-end
-
-local function each(list, fn)
-    for _, x in ipairs(list) do
-        pace()
-        pcall(fn, x)
-    end
-end
-
-local function clean(s)
-    return (tostring(s):gsub("%c", " "))
-end
-
-local function inGame(inst)
-    local ok, r = pcall(inst.IsDescendantOf, inst, game)
-    return ok and r == true
-end
-
-local function path(inst, intree)
-    local ok, p = pcall(inst.GetFullName, inst)
-    if not ok then return "<?>" end
-    if intree == nil then intree = inGame(inst) end
-    return (intree and "" or "[NIL] ") .. p
-end
-
-local function isCore(s)
-    local ok, r = pcall(function()
-        return (CoreGui and s:IsDescendantOf(CoreGui))
-            or (CorePackages and s:IsDescendantOf(CorePackages))
-    end)
-    return ok and r == true
-end
-
--- owner fungsi -> path script (di-cache per script, bukan per fungsi)
-local ownerCache = setmetatable({}, { __mode = "k" })
-local function ownerOf(f)
-    local ok, s = pcall(function() return getfenv(f).script end)
-    if ok and typeof(s) == "Instance" then
-        local c = ownerCache[s]
-        if not c then
-            c = path(s)
-            ownerCache[s] = c
-        end
-        return c
-    end
-    return nil
-end
-
-local function fnDesc(f, noOwner)
-    local i = {}
-    if debug.getinfo then
-        local ok, r = pcall(debug.getinfo, f)
-        if ok and type(r) == "table" then i = r end
-    end
-    local va = (i.is_vararg == true or i.is_vararg == 1) and "+..." or ""
-    local desc = ("fn:%s line=%s params=%s%s upv=%s"):format(
-        tostring(i.name or "?"), tostring(i.linedefined or i.line or "?"),
-        tostring(i.numparams or "?"), va, tostring(i.nups or "?"))
-    if not noOwner then
-        desc = desc .. " owner=" .. (ownerOf(f) or tostring(i.short_src or i.source or "?"))
-    end
-    return desc
-end
-
-local function constSummary(f)
-    if not debug.getconstants then return "" end
-    local ok, c = pcall(debug.getconstants, f)
-    if not ok or type(c) ~= "table" then return "" end
-    local s = {}
-    for _, k in next, c do
-        if type(k) == "string" and #k > 2 and #k < 60 then
-            s[#s + 1] = clean(k)
-            if #s >= 16 then break end
+local function merge(dst, src)
+    for k, v in next, src do
+        if type(v) == "table" and type(dst[k]) == "table" and dst[k][1] == nil then
+            merge(dst[k], v)
+        else
+            dst[k] = v
         end
     end
-    return #s > 0 and ("  consts={" .. table.concat(s, ", ") .. "}") or ""
 end
 
-local function upvalSummary(f)
-    if not debug.getupvalues then return "" end
-    local ok, u = pcall(debug.getupvalues, f)
-    if not ok or type(u) ~= "table" then return "" end
-    local types, n = {}, 0
-    for _, v in next, u do
-        n += 1
-        if n <= 6 then types[n] = typeof(v) end
+local SETTINGS_FILE = "DumpPP/settings.json"
+do
+    if CAP.isfile and CAP.readfile and HttpService then
+        local ok, data = pcall(function()
+            if CAP.isfile(SETTINGS_FILE) then return HttpService:JSONDecode(CAP.readfile(SETTINGS_FILE)) end
+        end)
+        if ok and type(data) == "table" then merge(CFG, data) end
     end
-    if n == 0 then return "" end
-    return "  upvals={" .. table.concat(types, ",") .. (n > 6 and ",..." or "") .. "}"
+    if type(ENV.DumperPP_Config) == "table" then merge(CFG, ENV.DumperPP_Config) end
 end
 
-local function mtSummary(t)
-    if not getrawmetatable then return nil end
-    local ok, mt = pcall(getrawmetatable, t)
-    if not ok or type(mt) ~= "table" then return nil end
-    local keys = {}
-    pcall(function()
-        for k, v in next, mt do
-            keys[#keys + 1] = tostring(k) .. "=" .. typeof(v)
-            if #keys >= 12 then break end
-        end
-    end)
-    return "{" .. table.concat(keys, ", ") .. "}"
-end
-
--- serializer: pakai `next` (bypass __pairs/__iter), tampilkan metatable
-local function ser(v, depth, seen, ind)
-    local t = typeof(v)
-    if t == "string" then
-        local s = clean(v:sub(1, CFG.MaxStringLen))
-        return '"' .. s .. (#v > CFG.MaxStringLen and '..."' or '"')
-    elseif t == "number" or t == "boolean" or t == "nil" then
-        return tostring(v)
-    elseif t == "Instance" then
-        local ok, cls = pcall(function() return v.ClassName end)
-        return ("Instance<%s> %s"):format(ok and cls or "?", path(v))
-    elseif t == "function" then
-        return fnDesc(v)
-    elseif t == "table" then
-        if seen[v] then return "<cycle>" end
-        if depth <= 0 then return "{...}" end
-        seen[v] = true
-        local out, n, cut = {}, 0, false
-        local mt = mtSummary(v)
-        if mt then out[#out + 1] = ind .. "  -- metatable: " .. mt end
+local saveQueued = false
+local function saveSettings()
+    if saveQueued or not (CAP.writefile and HttpService) then return end
+    saveQueued = true
+    task.delay(0.8, function()
+        saveQueued = false
         pcall(function()
-            for k, val in next, v do
-                n += 1
-                if n > CFG.MaxTableKeys then
-                    cut = true
-                    break
-                end
-                out[#out + 1] = ("%s  [%s] = %s"):format(
-                    ind, ser(k, 0, seen, ""), ser(val, depth - 1, seen, ind .. "  "))
+            if CAP.makefolder then pcall(CAP.makefolder, "DumpPP") end
+            CAP.writefile(SETTINGS_FILE, HttpService:JSONEncode(CFG))
+        end)
+    end)
+end
+
+---------------------------------------------------------------------
+-- 1. util (serializer, path, timeout, dsb)
+---------------------------------------------------------------------
+local U = {}
+do
+    local lastYield = os.clock()
+    function U.pace()
+        if APP.cancel then error("dihentikan", 0) end
+        if os.clock() - lastYield > CFG.FrameBudget then
+            task.wait()
+            lastYield = os.clock()
+        end
+    end
+    function U.each(list, fn)
+        for _, x in ipairs(list) do
+            U.pace()
+            pcall(fn, x)
+        end
+    end
+    function U.clean(s) return (tostring(s):gsub("%c", " ")) end
+
+    function U.inGame(inst)
+        local ok, r = pcall(inst.IsDescendantOf, inst, game)
+        return ok and r == true
+    end
+    function U.path(inst, intree)
+        local ok, p = pcall(inst.GetFullName, inst)
+        if not ok then return "<?>" end
+        if intree == nil then intree = U.inGame(inst) end
+        return (intree and "" or "[NIL] ") .. p
+    end
+    function U.isCore(s)
+        local ok, r = pcall(function()
+            return (CoreGui and s:IsDescendantOf(CoreGui)) or (CorePackages and s:IsDescendantOf(CorePackages))
+        end)
+        return ok and r == true
+    end
+
+    local ownerCache = setmetatable({}, { __mode = "k" })
+    function U.ownerOf(f)
+        local ok, s = pcall(function() return getfenv(f).script end)
+        if ok and typeof(s) == "Instance" then
+            local c = ownerCache[s]
+            if not c then
+                c = U.path(s)
+                ownerCache[s] = c
+            end
+            return c
+        end
+        return nil
+    end
+
+    function U.fnDesc(f, noOwner)
+        local i = {}
+        if debug.getinfo then
+            local ok, r = pcall(debug.getinfo, f)
+            if ok and type(r) == "table" then i = r end
+        end
+        local va = (i.is_vararg == true or i.is_vararg == 1) and "+..." or ""
+        local d = ("fn:%s line=%s params=%s%s upv=%s"):format(
+            tostring(i.name or "?"), tostring(i.linedefined or i.line or "?"),
+            tostring(i.numparams or "?"), va, tostring(i.nups or "?"))
+        if not noOwner then d = d .. " owner=" .. (U.ownerOf(f) or tostring(i.short_src or i.source or "?")) end
+        return d
+    end
+    function U.constSummary(f)
+        if not debug.getconstants then return "" end
+        local ok, c = pcall(debug.getconstants, f)
+        if not ok or type(c) ~= "table" then return "" end
+        local s = {}
+        for _, k in next, c do
+            if type(k) == "string" and #k > 2 and #k < 60 then
+                s[#s + 1] = U.clean(k)
+                if #s >= 16 then break end
+            end
+        end
+        return #s > 0 and ("  consts={" .. table.concat(s, ", ") .. "}") or ""
+    end
+    function U.upvalSummary(f)
+        if not debug.getupvalues then return "" end
+        local ok, u = pcall(debug.getupvalues, f)
+        if not ok or type(u) ~= "table" then return "" end
+        local types, n = {}, 0
+        for _, v in next, u do
+            n += 1
+            if n <= 6 then types[n] = typeof(v) end
+        end
+        if n == 0 then return "" end
+        return "  upvals={" .. table.concat(types, ",") .. (n > 6 and ",..." or "") .. "}"
+    end
+    local function mtSummary(t)
+        if not CAP.getrawmetatable then return nil end
+        local ok, mt = pcall(CAP.getrawmetatable, t)
+        if not ok or type(mt) ~= "table" then return nil end
+        local keys = {}
+        pcall(function()
+            for k, v in next, mt do
+                keys[#keys + 1] = tostring(k) .. "=" .. typeof(v)
+                if #keys >= 12 then break end
             end
         end)
-        seen[v] = nil
-        if #out == 0 then return "{}" end
-        if cut then out[#out + 1] = ind .. "  -- (dipotong)" end
-        return "{\n" .. table.concat(out, ",\n") .. "\n" .. ind .. "}"
+        return "{" .. table.concat(keys, ", ") .. "}"
     end
-    local ok, s = pcall(tostring, v)
-    return ("%s(%s)"):format(t, clean(ok and s or "?"))
+
+    -- serializer: pakai `next` (bypass __pairs/__iter), tampilkan metatable
+    function U.ser(v, depth, seen, ind)
+        local t = typeof(v)
+        if t == "string" then
+            local s = U.clean(v:sub(1, CFG.MaxStringLen))
+            return '"' .. s .. (#v > CFG.MaxStringLen and '..."' or '"')
+        elseif t == "number" or t == "boolean" or t == "nil" then
+            return tostring(v)
+        elseif t == "Instance" then
+            local ok, cls = pcall(function() return v.ClassName end)
+            return ("Instance<%s> %s"):format(ok and cls or "?", U.path(v))
+        elseif t == "function" then
+            return U.fnDesc(v)
+        elseif t == "table" then
+            if seen[v] then return "<cycle>" end
+            if depth <= 0 then return "{...}" end
+            seen[v] = true
+            local out, n, cut = {}, 0, false
+            local mt = mtSummary(v)
+            if mt then out[#out + 1] = ind .. "  -- metatable: " .. mt end
+            pcall(function()
+                for k, val in next, v do
+                    n += 1
+                    if n > CFG.MaxTableKeys then
+                        cut = true
+                        break
+                    end
+                    out[#out + 1] = ("%s  [%s] = %s"):format(ind, U.ser(k, 0, seen, ""), U.ser(val, depth - 1, seen, ind .. "  "))
+                end
+            end)
+            seen[v] = nil
+            if #out == 0 then return "{}" end
+            if cut then out[#out + 1] = ind .. "  -- (dipotong)" end
+            return "{\n" .. table.concat(out, ",\n") .. "\n" .. ind .. "}"
+        end
+        local ok, s = pcall(tostring, v)
+        return ("%s(%s)"):format(t, U.clean(ok and s or "?"))
+    end
+
+    -- jalankan fungsi dengan timeout; thread yang kelamaan dibatalkan
+    function U.withTimeout(fn, timeout, ...)
+        local done, ok, res = false, false, nil
+        local args = table.pack(...)
+        local th = task.spawn(function()
+            ok, res = pcall(fn, table.unpack(args, 1, args.n))
+            done = true
+        end)
+        local t0 = os.clock()
+        while not done and os.clock() - t0 < timeout do task.wait() end
+        if not done then
+            pcall(task.cancel, th)
+            return false, "timeout"
+        end
+        return ok, res
+    end
+
+    -- fallback kalau decompile mati: constants + upvalue + proto (rekursif)
+    local function closureReport(f, out, depth, ind)
+        if #out > 6000 then return end
+        out[#out + 1] = ind .. "-- " .. U.fnDesc(f, true) .. U.upvalSummary(f)
+        if debug.getconstants then
+            local ok, c = pcall(debug.getconstants, f)
+            if ok and type(c) == "table" then
+                for i, k in next, c do
+                    local tk = type(k)
+                    if tk == "string" then
+                        out[#out + 1] = ("%s-- k[%s] \"%s\""):format(ind, tostring(i), U.clean(k:sub(1, 120)))
+                    elseif tk == "number" then
+                        out[#out + 1] = ("%s-- k[%s] %s"):format(ind, tostring(i), tostring(k))
+                    end
+                end
+            end
+        end
+        if depth > 0 and debug.getprotos then
+            local ok, protos = pcall(debug.getprotos, f)
+            if ok and type(protos) == "table" then
+                for _, p in next, protos do
+                    if type(p) == "function" then closureReport(p, out, depth - 1, ind .. "  ") end
+                end
+            end
+        end
+    end
+    function U.fallbackBody(s)
+        if not CAP.getscriptclosure then return "-- executor tidak punya decompile maupun getscriptclosure" end
+        local ok, f = pcall(CAP.getscriptclosure, s)
+        if not ok or type(f) ~= "function" then return "-- getscriptclosure gagal" end
+        local out = { "-- [fallback] constants / upvalue / proto dari closure script" }
+        closureReport(f, out, 3, "")
+        return table.concat(out, "\n")
+    end
+
+    -- "CamelCase_name" -> {"camel","case","name"}
+    function U.tokens(name)
+        local s = tostring(name):gsub("(%l)(%u)", "%1 %2")
+        s = s:gsub("(%u)(%u%l)", "%1 %2")
+        local out = {}
+        for w in s:lower():gmatch("%a+") do out[#out + 1] = w end
+        return out
+    end
 end
 
 ---------------------------------------------------------------------
--- writer berbuffer + auto-split file besar + flush semua saat error
+-- 2. log sesi + writer berbuffer (auto-split file besar)
 ---------------------------------------------------------------------
-local writers = {}
-local function newWriter(name, ext)
-    ext = ext or "txt"
-    local part, bytes, buf, n = 1, 0, {}, 0
-    local function fileName()
-        if part == 1 then return ("%s/%s.%s"):format(ROOT, name, ext) end
-        return ("%s/%s.part%d.%s"):format(ROOT, name, part, ext)
-    end
-    local current = fileName()
-    writefile(current, "")
+local LOG = { lines = {}, errors = {}, pending = {} }
+local W = { root = nil, gname = "Game", files = {}, all = {} }
 
-    local w = {}
+function LOG.add(level, msg)
+    msg = tostring(msg)
+    if level == "warn" or level == "error" then warn("[Dumper++] " .. msg) else print("[Dumper++] " .. msg) end
+    if level == "error" then LOG.errors[#LOG.errors + 1] = msg end
+    local e = { level = level, text = ("%s [%s] %s"):format(os.date("%H:%M:%S"), level:upper():sub(1, 4), msg) }
+    LOG.lines[#LOG.lines + 1] = e
+    if #LOG.lines > 400 then table.remove(LOG.lines, 1) end
+    if LOG.w then LOG.w.add(e.text) else LOG.pending[#LOG.pending + 1] = e.text end
+    if LOG.onAdd then pcall(LOG.onAdd, e) end
+end
+
+function W.ensureRoot()
+    if W.root then return W.root end
+    local base = ("DumpPP/%d_%s"):format(game.PlaceId, W.gname)
+    W.root = ("%s/%s"):format(base, os.date("%Y%m%d_%H%M%S"))
+    if CAN_WRITE then
+        pcall(CAP.makefolder, "DumpPP")
+        pcall(CAP.makefolder, base)
+        pcall(CAP.makefolder, W.root)
+    end
+    LOG.w = W.new("_session", "log")
+    for _, l in ipairs(LOG.pending) do LOG.w.add(l) end
+    LOG.pending = {}
+    return W.root
+end
+
+function W.newRoot()
+    W.root, LOG.w, W.files = nil, nil, {}
+end
+
+function W.new(name, ext, sub)
+    ext = ext or "txt"
+    local root = W.ensureRoot()
+    local dir = root
+    if sub then
+        dir = root .. "/" .. sub
+        if CAN_WRITE then pcall(CAP.makefolder, dir) end
+    end
+    local part, bytes, buf, n = 1, 0, {}, 0
+    local function fname()
+        if part == 1 then return ("%s/%s.%s"):format(dir, name, ext) end
+        return ("%s/%s.part%d.%s"):format(dir, name, part, ext)
+    end
+    local current = fname()
+    if CAN_WRITE then pcall(CAP.writefile, current, "") end
+    W.files[#W.files + 1] = current
+
+    local w = { bytes = 0 }
     local function flush()
         if n > 0 then
-            appendfile(current, table.concat(buf, "\n", 1, n) .. "\n")
+            if CAN_WRITE then pcall(CAP.appendfile, current, table.concat(buf, "\n", 1, n) .. "\n") end
             buf, n = {}, 0
         end
     end
@@ -373,658 +409,1513 @@ local function newWriter(name, ext)
         n += 1
         buf[n] = line
         bytes += #line + 1
+        w.bytes += #line + 1
         if n >= 300 then flush() end
         if bytes >= CFG.MaxFileBytes then
             flush()
             part += 1
             bytes = 0
-            current = fileName()
-            writefile(current, "")
+            current = fname()
+            if CAN_WRITE then pcall(CAP.writefile, current, "") end
+            W.files[#W.files + 1] = current
         end
     end
     w.close = flush
-    writers[#writers + 1] = w
+    W.all[#W.all + 1] = w
     return w
 end
 
-local function flushAll()
-    for _, w in ipairs(writers) do pcall(w.close) end
+function W.flushAll()
+    for _, w in ipairs(W.all) do pcall(w.close) end
 end
+
+-- nama game (non-blocking, dengan timeout)
+task.spawn(function()
+    local ok, info = U.withTimeout(function()
+        return svc("MarketplaceService"):GetProductInfo(game.PlaceId)
+    end, 5)
+    if ok and type(info) == "table" and info.Name then
+        W.gname = (tostring(info.Name):gsub("[^%w_%-]", "_")):sub(1, 40)
+    end
+end)
 
 ---------------------------------------------------------------------
--- state bersama
+-- 3. SCANNER: deteksi sistem di dalam map
 ---------------------------------------------------------------------
-local errors, timings = {}, {}
-local scriptList, scriptSet, remotes = {}, {}, {}
-local loadedMods, loadedList = {}, {}
-local counts = {
-    tree = 0, nil_ = 0, values = 0, attrs = 0, tags = 0,
-    scripts = 0, dups = 0, modules = 0, senv = 0,
-    remotes = 0, gcFuncs = 0, gcTables = 0, captured = 0,
+local SYSTEMS = {
+    { id = "currency", name = "Currency / Economy",  kw = { "coin", "cash", "money", "gold", "gem", "currency", "buck", "credit", "token", "diamond", "wallet", "robux" } },
+    { id = "inventory", name = "Inventory / Items",  kw = { "inventory", "backpack", "item", "loot", "equip", "hotbar", "bag", "drop", "tool" } },
+    { id = "combat", name = "Combat / Damage",       kw = { "damage", "hit", "hitbox", "attack", "weapon", "sword", "gun", "parry", "block", "combat", "skill", "ability", "cooldown", "projectile", "health", "knockback" } },
+    { id = "shop", name = "Shop / Purchase",         kw = { "shop", "store", "purchase", "buy", "sell", "market", "gamepass", "product", "merchant", "trade" } },
+    { id = "quest", name = "Quest / Reward",         kw = { "quest", "mission", "task", "objective", "achievement", "reward", "daily", "claim", "bounty" } },
+    { id = "pets", name = "Pets / Mounts",           kw = { "pet", "egg", "hatch", "companion", "mount", "follower" } },
+    { id = "stats", name = "Stats / Progression",    kw = { "level", "xp", "exp", "rank", "stat", "prestige", "rebirth", "upgrade", "leaderstats", "progress", "mastery", "power", "strength" } },
+    { id = "data", name = "Data / Save",             kw = { "data", "profile", "save", "session", "datastore", "replica", "settings" } },
+    { id = "farm", name = "Farm / Gather",           kw = { "farm", "mine", "ore", "harvest", "crop", "plant", "chop", "fish", "collect", "gather", "craft", "resource" } },
+    { id = "world", name = "World / NPC / Spawn",    kw = { "npc", "mob", "enemy", "boss", "spawn", "zone", "teleport", "portal", "dungeon", "wave", "raid", "checkpoint" } },
+    { id = "vehicle", name = "Vehicle / Movement",   kw = { "vehicle", "car", "seat", "boat", "plane", "drive", "sprint", "dash", "stamina", "fly" } },
+    { id = "social", name = "Social / Party",        kw = { "party", "friend", "chat", "clan", "guild", "team", "invite", "emote", "lobby", "match" } },
+}
+local SYS_BY_ID = {}
+for _, s in ipairs(SYSTEMS) do SYS_BY_ID[s.id] = s end
+
+local FRAMEWORKS = {
+    knit = "Knit", promise = "Promise", signal = "Signal", janitor = "Janitor", maid = "Maid", trove = "Trove",
+    roact = "Roact", react = "React", fusion = "Fusion", matter = "Matter (ECS)", cmdr = "Cmdr",
+    profileservice = "ProfileService", replicaservice = "ReplicaService", bridgenet = "BridgeNet",
+    bridgenet2 = "BridgeNet2", bytenet = "ByteNet", blink = "Blink", zap = "Zap", comm = "Comm",
+    rodux = "Rodux", nevermore = "Nevermore", aerogameframework = "AeroGameFramework",
+    packages = "Wally Packages", rbxts_include = "roblox-ts",
 }
 
-local function addScript(s)
-    if not scriptSet[s] then
-        scriptSet[s] = true
-        scriptList[#scriptList + 1] = s
+local KIND = {}
+for _, c in ipairs({ "RemoteEvent", "RemoteFunction", "UnreliableRemoteEvent", "BindableEvent", "BindableFunction" }) do KIND[c] = "remote" end
+for _, c in ipairs({ "Script", "LocalScript", "ModuleScript" }) do KIND[c] = "script" end
+for _, c in ipairs({ "BoolValue", "IntValue", "NumberValue", "StringValue", "ObjectValue", "CFrameValue", "Vector3Value", "Color3Value", "BrickColorValue", "RayValue" }) do KIND[c] = "value" end
+for _, c in ipairs({ "Folder", "Configuration" }) do KIND[c] = "folder" end
+for _, c in ipairs({ "Model", "Tool", "Humanoid", "Player" }) do KIND[c] = "obj" end
+KIND.ScreenGui = "gui"
+local WEIGHT = { remote = 3, script = 2, value = 2, folder = 1, obj = 1, gui = 1, attr = 1 }
+local ATTR_KINDS = { folder = true, obj = true, gui = true }
+
+local INDEX = { all = {}, remotes = {}, scripts = {}, values = {}, attrs = {} }
+local SCAN = { done = false, busy = false, at = 0, systems = {}, frameworks = {}, info = {} }
+local S = {}
+
+local KW, NAME_MEMO, memoN, customToks = {}, {}, 0, {}
+local function addKW(tok, id)
+    local l = KW[tok]
+    if not l then
+        l = {}
+        KW[tok] = l
     end
+    l[#l + 1] = id
+end
+for _, s in ipairs(SYSTEMS) do
+    for _, k in ipairs(s.kw) do addKW(k, s.id) end
 end
 
-local REMOTE_CLASSES = {
-    RemoteEvent = true, RemoteFunction = true, UnreliableRemoteEvent = true,
-    BindableEvent = true, BindableFunction = true,
-}
-
-local function phase(name, enabled, fn)
-    phaseIdx += 1
-    if not enabled then return end
-    if ENV.DumperPP_Stop then return end
-    curBase = (phaseIdx - 1) / PHASE_TOTAL
-    status(name .. " ...", curBase)
-    local t0 = os.clock()
-    local ok, err = pcall(fn)
-    flushAll()
-    timings[name] = math.floor((os.clock() - t0) * 100) / 100
-    if not ok then
-        errors[#errors + 1] = name .. ": " .. tostring(err)
-        status(name .. " gagal (lihat _errors.txt)")
-    end
-end
-
--- jalankan fungsi dengan timeout; thread yang kelamaan dibatalkan
-local function withTimeout(fn, timeout, ...)
-    local done, ok, res = false, false, nil
-    local args = table.pack(...)
-    local th = task.spawn(function()
-        ok, res = pcall(fn, table.unpack(args, 1, args.n))
-        done = true
-    end)
-    local t0 = os.clock()
-    while not done and os.clock() - t0 < timeout do task.wait() end
-    if not done then
-        pcall(task.cancel, th)
-        return false, "timeout"
-    end
-    return ok, res
-end
-
--- fallback kalau decompile mati: constants + upvalue + proto (rekursif)
-local function closureReport(f, out, depth, ind)
-    if #out > 6000 then return end
-    out[#out + 1] = ind .. "-- " .. fnDesc(f, true) .. upvalSummary(f)
-    if debug.getconstants then
-        local ok, c = pcall(debug.getconstants, f)
-        if ok and type(c) == "table" then
-            for i, k in next, c do
-                local tk = type(k)
-                if tk == "string" then
-                    out[#out + 1] = ("%s-- k[%s] \"%s\""):format(ind, tostring(i), clean(k:sub(1, 120)))
-                elseif tk == "number" then
-                    out[#out + 1] = ("%s-- k[%s] %s"):format(ind, tostring(i), tostring(k))
+function S.classify(name)
+    local m = NAME_MEMO[name]
+    if m then return m end
+    m = {}
+    local seen = {}
+    for _, w in ipairs(U.tokens(name)) do
+        local ids = KW[w] or (w:sub(-1) == "s" and KW[w:sub(1, -2)]) or nil
+        if ids then
+            for _, id in ipairs(ids) do
+                if not seen[id] then
+                    seen[id] = true
+                    m[#m + 1] = id
                 end
             end
         end
     end
-    if depth > 0 and debug.getprotos then
-        local ok, protos = pcall(debug.getprotos, f)
-        if ok and type(protos) == "table" then
-            for _, p in next, protos do
-                if type(p) == "function" then closureReport(p, out, depth - 1, ind .. "  ") end
+    memoN += 1
+    if memoN > 60000 then NAME_MEMO, memoN = {}, 0 end
+    NAME_MEMO[name] = m
+    return m
+end
+
+-- scope: sistem yang dipilih user (kosong = seluruh game)
+local SC = { sel = {} }
+local scMemo = setmetatable({}, { __mode = "k" })
+function SC.active() return next(SC.sel) ~= nil end
+function SC.reset() scMemo = setmetatable({}, { __mode = "k" }) end
+function SC.inst(inst)
+    if not SC.active() then return true end
+    local r = scMemo[inst]
+    if r ~= nil then return r end
+    r = false
+    local okN, name = pcall(function() return inst.Name end)
+    if okN then
+        for _, id in ipairs(S.classify(name)) do
+            if SC.sel[id] then
+                r = true
+                break
+            end
+        end
+        if not r then
+            local okP, par = pcall(function() return inst.Parent end)
+            if okP and par and par ~= game then r = SC.inst(par) end
+        end
+    end
+    scMemo[inst] = r
+    return r
+end
+function SC.str(p)
+    if not SC.active() then return true end
+    for seg in tostring(p):gmatch("[^%.]+") do
+        for _, id in ipairs(S.classify(seg)) do
+            if SC.sel[id] then return true end
+        end
+    end
+    return false
+end
+function SC.keywords() -- kata kunci aktif (untuk skor tabel GC)
+    local out = {}
+    for id in next, SC.sel do
+        local def = SYS_BY_ID[id]
+        if def then
+            for _, k in ipairs(def.kw) do out[#out + 1] = k end
+        end
+    end
+    for _, k in ipairs(customToks) do out[#out + 1] = k end
+    return out
+end
+function S.setCustom(str)
+    for _, tok in ipairs(customToks) do
+        local l = KW[tok]
+        if l then
+            for i = #l, 1, -1 do
+                if l[i] == "custom" then table.remove(l, i) end
+            end
+            if #l == 0 then KW[tok] = nil end
+        end
+    end
+    customToks = {}
+    for tok in tostring(str or ""):lower():gmatch("[%w_]+") do
+        customToks[#customToks + 1] = tok
+        addKW(tok, "custom")
+    end
+    NAME_MEMO, memoN = {}, 0
+    if #customToks > 0 then SC.sel.custom = true else SC.sel.custom = nil end
+    SC.reset()
+end
+
+local function mergeIds(a, b)
+    local out, seen = {}, {}
+    for _, id in ipairs(a) do if not seen[id] then seen[id] = true out[#out + 1] = id end end
+    for _, id in ipairs(b) do if not seen[id] then seen[id] = true out[#out + 1] = id end end
+    return out
+end
+
+function S.run(progress)
+    progress = progress or function() end
+    SCAN.busy = true
+    local t0 = os.clock()
+    NAME_MEMO, memoN = {}, 0
+    SC.reset()
+
+    local list
+    if CAP.getinstances then
+        local ok, r = pcall(CAP.getinstances)
+        if ok and type(r) == "table" then list = r end
+    end
+    if not list then
+        list = game:GetDescendants()
+        if CAP.getnilinstances then
+            local ok, nils = pcall(CAP.getnilinstances)
+            if ok and type(nils) == "table" then
+                for _, i in ipairs(nils) do list[#list + 1] = i end
             end
         end
     end
-end
 
-local function fallbackBody(s)
-    if not getscriptclosure then
-        return "-- executor tidak punya decompile maupun getscriptclosure"
+    INDEX.all, INDEX.remotes, INDEX.scripts, INDEX.values, INDEX.attrs = list, {}, {}, {}, {}
+    local HIT, fw, kindCount = {}, {}, {}
+    for _, s in ipairs(SYSTEMS) do
+        HIT[s.id] = { score = 0, remote = 0, script = 0, value = 0, folder = 0, obj = 0, gui = 0, attr = 0, samples = {} }
     end
-    local ok, f = pcall(getscriptclosure, s)
-    if not ok or type(f) ~= "function" then return "-- getscriptclosure gagal" end
-    local out = { "-- [fallback] constants / upvalue / proto dari closure script" }
-    closureReport(f, out, 3, "")
-    return table.concat(out, "\n")
-end
 
----------------------------------------------------------------------
--- 1. semua instance (termasuk nil-parented) + values + attributes
----------------------------------------------------------------------
-phase("instances", true, function()
-    local list
-    if getinstances then
-        list = getinstances()
-    else
-        list = game:GetDescendants()
-        if getnilinstances then
-            for _, i in ipairs(getnilinstances()) do list[#list + 1] = i end
+    local function hit(ids, kind, inst)
+        for _, id in ipairs(ids) do
+            local h = HIT[id]
+            if h then
+                h.score += WEIGHT[kind] or 1
+                h[kind] = (h[kind] or 0) + 1
+                if #h.samples < 3 and kind ~= "attr" then h.samples[#h.samples + 1] = U.path(inst) end
+            end
         end
     end
-    local total = #list
-
-    local wTree = newWriter("instances")
-    local wNil = newWriter("nil_instances")
-    local wVals = CFG.DumpValues and newWriter("values") or nil
-    local wAttr = CFG.DumpValues and newWriter("attributes") or nil
-    local classCount = {}
 
     local function handle(inst)
-        if inst == game then return end
-        if ui.gui and (inst == ui.gui or inst:IsDescendantOf(ui.gui)) then return end
+        local kind = KIND[inst.ClassName]
+        if not kind or inst == game then return end
+        if APP.gui and inst:IsDescendantOf(APP.gui) then return end
+        if not CFG.DumpCore and U.isCore(inst) then return end
 
-        local cls = inst.ClassName
-        local intree = inGame(inst)
-        local p = path(inst, intree)
-
-        local w = intree and wTree or wNil
-        w.add(("%-26s %s"):format(cls, p))
-        if intree then counts.tree += 1 else counts.nil_ += 1 end
-        classCount[cls] = (classCount[cls] or 0) + 1
-
-        if inst:IsA("LuaSourceContainer") then addScript(inst) end
-        if REMOTE_CLASSES[cls] then remotes[#remotes + 1] = inst end
-
-        if wVals then
-            if inst:IsA("ValueBase") then
-                local okv, val = pcall(function() return inst.Value end)
-                wVals.add(("%-14s %s = %s"):format(cls, p, okv and ser(val, 2, {}, "") or "<?>"))
-                counts.values += 1
+        local name = inst.Name
+        kindCount[kind] = (kindCount[kind] or 0) + 1
+        local ids = S.classify(name)
+        if kind == "remote" or kind == "script" or kind == "value" then
+            local par = inst.Parent
+            if par then
+                local pids = S.classify(par.Name)
+                if #pids > 0 then ids = mergeIds(ids, pids) end
             end
-            local oka, attrs = pcall(inst.GetAttributes, inst)
-            if oka and type(attrs) == "table" and next(attrs) ~= nil then
-                wAttr.add(p)
-                for k, val in next, attrs do
-                    wAttr.add(("    %s = %s"):format(tostring(k), ser(val, 2, {}, "    ")))
+            local bucket = (kind == "remote" and INDEX.remotes) or (kind == "script" and INDEX.scripts) or INDEX.values
+            bucket[#bucket + 1] = inst
+        end
+        if kind == "script" or kind == "folder" then
+            local f = FRAMEWORKS[name:lower()]
+            if f then fw[f] = (fw[f] or 0) + 1 end
+        end
+        if #ids > 0 then hit(ids, kind, inst) end
+
+        if ATTR_KINDS[kind] then
+            local ok, a = pcall(inst.GetAttributes, inst)
+            if ok and type(a) == "table" and next(a) ~= nil then
+                INDEX.attrs[#INDEX.attrs + 1] = inst
+                for k in next, a do
+                    local aids = S.classify(tostring(k))
+                    if #aids > 0 then hit(aids, "attr", inst) end
                 end
-                counts.attrs += 1
             end
         end
     end
 
-    for i, inst in ipairs(list) do
-        pace()
-        pcall(handle, inst)
-        if i % 2000 == 0 then
-            sub(i / total, ("instances %d/%d"):format(i, total))
+    local total = #list
+    for i = 1, total do
+        U.pace()
+        pcall(handle, list[i])
+        if i % 3000 == 0 then progress(i / total, ("scan %d/%d"):format(i, total)) end
+    end
+
+    -- service / player yang sering punya attribute
+    for _, inst in ipairs({ workspace, svc("ReplicatedStorage"), Players and Players.LocalPlayer }) do
+        if inst then
+            local ok, a = pcall(inst.GetAttributes, inst)
+            if ok and type(a) == "table" and next(a) ~= nil then INDEX.attrs[#INDEX.attrs + 1] = inst end
         end
     end
 
-    local rows = {}
-    for cls, n in next, classCount do rows[#rows + 1] = { cls, n } end
-    table.sort(rows, function(a, b) return a[2] > b[2] end)
-    local wc = newWriter("class_stats")
-    for _, r in ipairs(rows) do wc.add(("%8d  %s"):format(r[2], r[1])) end
-end)
-
----------------------------------------------------------------------
--- 2. CollectionService tags
----------------------------------------------------------------------
-phase("tags", CFG.DumpTags, function()
-    local CS = svc("CollectionService")
-    local w = newWriter("tags")
-    for _, tag in ipairs(CS:GetAllTags()) do
-        pace()
-        local items = CS:GetTagged(tag)
-        w.add(("## %s (%d)"):format(tag, #items))
-        for i, inst in ipairs(items) do
-            if i > 50 then
-                w.add("  ...")
-                break
-            end
-            w.add("  " .. path(inst))
-        end
-        counts.tags += 1
-    end
-end)
-
----------------------------------------------------------------------
--- 3. script + module: decompile paralel, dedup by hash
----------------------------------------------------------------------
-phase("scripts", true, function()
-    if getscripts then
-        for _, s in ipairs(getscripts()) do addScript(s) end
-    end
-    if getloadedmodules then
-        for _, m in ipairs(getloadedmodules()) do
-            loadedMods[m] = true
-            loadedList[#loadedList + 1] = m
-            addScript(m)
+    local systems = {}
+    for _, s in ipairs(SYSTEMS) do
+        local h = HIT[s.id]
+        if h.score > 0 then
+            systems[#systems + 1] = {
+                id = s.id, name = s.name, score = h.score, remote = h.remote, script = h.script,
+                value = h.value, other = h.folder + h.obj + h.gui, attr = h.attr, samples = h.samples,
+            }
         end
     end
+    table.sort(systems, function(a, b) return a.score > b.score end)
 
-    -- pass 1: metadata + deteksi duplikat (script identik cuma di-decompile sekali)
-    local meta, jobs, primaryOf = {}, {}, {}
-    for _, s in ipairs(scriptList) do
-        pace()
-        if CFG.DumpCore or not isCore(s) then
-            local i = #meta + 1
-            local p = path(s)
-            local hash
-            if getscripthash then
-                local ok, h = pcall(getscripthash, s)
-                if ok and h then hash = tostring(h) end
-            end
-            local fname = ("%04d_%s.lua"):format(i, (p:gsub("[^%w_%.%-]", "_")):sub(-90))
-            local m = { s = s, p = p, hash = hash, fname = fname, cls = s.ClassName }
-            meta[i] = m
-            local primary = hash and primaryOf[hash]
-            if primary then
-                m.dupOf = primary
-                primary.copies = (primary.copies or 1) + 1
-                counts.dups += 1
-            else
-                if hash then primaryOf[hash] = m end
-                jobs[#jobs + 1] = m
-            end
-        end
+    local fwList = {}
+    for n, c in next, fw do fwList[#fwList + 1] = ("%s x%d"):format(n, c) end
+    table.sort(fwList)
+
+    local treeCount = #game:GetDescendants()
+    local lp = Players and Players.LocalPlayer
+    local execName = "?"
+    if CAP.identifyexecutor then
+        local ok, n = pcall(CAP.identifyexecutor)
+        if ok then execName = tostring(n) end
     end
+    SCAN.info = {
+        executor = execName, total = total, tree = treeCount, nil_ = math.max(0, total - treeCount),
+        remotes = #INDEX.remotes, scripts = #INDEX.scripts, values = #INDEX.values, attrs = #INDEX.attrs,
+        streaming = (function() local ok, v = pcall(function() return workspace.StreamingEnabled end) return ok and v end)(),
+        players = Players and #Players:GetPlayers() or 0,
+        character = lp and lp.Character ~= nil or false,
+        leaderstats = lp and lp:FindFirstChild("leaderstats") ~= nil or false,
+        seconds = math.floor((os.clock() - t0) * 100) / 100,
+    }
+    SCAN.systems, SCAN.frameworks, SCAN.done, SCAN.at, SCAN.busy = systems, fwList, true, os.clock(), false
+    LOG.add("info", ("scan selesai: %d instance, %d sistem terdeteksi (%.2fs)"):format(total, #systems, SCAN.info.seconds))
+    progress(1, "scan selesai")
+end
 
-    local function process(m)
-        local s = m.s
-        local body
-        if CFG.DecompileScripts and decompile then
-            local ok, r = withTimeout(decompile, CFG.ScriptTimeout, s)
-            if ok and type(r) == "string" and #r > 0 then
-                body = r
-            else
-                body = "-- decompile gagal: " .. tostring(ok and "hasil kosong" or r)
-                    .. "\n" .. fallbackBody(s)
-            end
-        else
-            body = fallbackBody(s)
-        end
+---------------------------------------------------------------------
+-- 4. DUMP ENGINE (fase-fase v2, sekarang mengikuti scope & hasil scan)
+---------------------------------------------------------------------
+local D = { running = false }
+function D.status(text, frac, quiet)
+    if not quiet then LOG.add("info", text) end
+    if D.onStatus then pcall(D.onStatus, text, frac) end
+end
 
-        local extra = ""
-        pcall(function()
-            if s:IsA("BaseScript") then
-                extra = ("-- Enabled   : %s\n-- RunContext: %s\n"):format(
-                    tostring(s.Enabled), tostring(s.RunContext))
-            end
-        end)
+function D.run()
+    if D.running then return end
+    if not CAN_WRITE then
+        LOG.add("error", "executor tidak punya writefile/appendfile/makefolder: dump dibatalkan")
+        return
+    end
+    D.running, APP.cancel = true, false
+    W.newRoot()
+    local ROOT = W.ensureRoot()
+    pcall(CAP.makefolder, ROOT .. "/scripts")
+    if CFG.DumpBytecode then pcall(CAP.makefolder, ROOT .. "/bytecode") end
 
-        local header = ("-- Path      : %s\n-- Class     : %s\n-- Hash      : %s\n-- Loaded    : %s\n-- Copies    : %d\n%s\n"):format(
-            m.p, m.cls, m.hash or "?", tostring(loadedMods[s] == true), m.copies or 1, extra)
-        writefile(ROOT .. "/scripts/" .. m.fname, header .. body)
+    local M = CFG.Modules
+    local errors, timings = {}, {}
+    local counts = {
+        tree = 0, nil_ = 0, values = 0, attrs = 0, tags = 0, scripts = 0, dups = 0,
+        modules = 0, senv = 0, remotes = 0, gcFuncs = 0, gcTables = 0,
+    }
+    local selNames = {}
+    for id in next, SC.sel do selNames[#selNames + 1] = id end
+    table.sort(selNames)
+    local scoped = SC.active()
+    LOG.add("info", scoped and ("scope: " .. table.concat(selNames, ", ")) or "scope: seluruh game")
 
-        if CFG.DumpBytecode and getscriptbytecode then
-            local okb, bc = pcall(getscriptbytecode, s)
-            if okb and type(bc) == "string" then
-                local bname = (m.fname:gsub("%.lua$", ".bin"))
-                pcall(writefile, ROOT .. "/bytecode/" .. bname, bc)
-            end
+    local phasesOn = {
+        M.instances, M.tags, M.scripts, M.modules_return and CAP.getloadedmodules, M.senv and CAP.getsenv,
+        M.gc and CAP.getgc, M.remotes, M.saveinstance and CAP.saveinstance,
+    }
+    local total, phaseNo, curBase = 0, 0, 0
+    for i = 1, 8 do if phasesOn[i] then total += 1 end end
+    total = math.max(total, 1)
+
+    local function sub(frac, text) D.status(text, curBase + frac / total, true) end
+    local function phase(name, enabled, fn)
+        if not enabled or APP.cancel then return end
+        phaseNo += 1
+        curBase = (phaseNo - 1) / total
+        D.status(name .. " ...", curBase)
+        local t0 = os.clock()
+        local ok, err = pcall(fn)
+        W.flushAll()
+        timings[name] = math.floor((os.clock() - t0) * 100) / 100
+        if not ok then
+            errors[#errors + 1] = name .. ": " .. tostring(err)
+            LOG.add("error", name .. " gagal: " .. tostring(err))
         end
     end
 
-    -- pass 2: worker pool
-    local N = math.max(1, CFG.DecompileWorkers)
-    local nextJob, finished, workersDone = 1, 0, 0
-    local totalJobs = #jobs
+    local ok, err = pcall(function()
+        if not SCAN.done or os.clock() - SCAN.at > 60 then
+            D.status("refresh scan ...", 0)
+            S.run(function(f, t) D.status(t, f * 0.02, true) end)
+        end
 
-    local function worker()
-        while true do
-            pace()
-            local i = nextJob
-            if i > totalJobs then return end
-            nextJob = i + 1
-            local job = jobs[i]
-            local ok, err = pcall(process, job)
-            if ok then
-                counts.scripts += 1
-            else
-                errors[#errors + 1] = ("script %s: %s"):format(job.p, tostring(err))
-            end
-            finished += 1
-            if finished % 5 == 0 then
-                sub(finished / totalJobs, ("scripts %d/%d (dup dilewati: %d)"):format(
-                    finished, totalJobs, counts.dups))
+        local scriptList, scriptSet, loadedMods, loadedList = {}, {}, {}, {}
+        local function addScript(s)
+            if not scriptSet[s] then
+                scriptSet[s] = true
+                scriptList[#scriptList + 1] = s
             end
         end
-    end
 
-    for _ = 1, N do
-        task.spawn(function()
-            pcall(worker)
-            workersDone += 1
-        end)
-    end
-    while workersDone < N do task.wait(0.1) end
-
-    local idx = newWriter("scripts/_index")
-    for _, m in ipairs(meta) do
-        local where = m.dupOf and ("dup -> " .. m.dupOf.fname) or m.fname
-        idx.add(("%s | %s | %s | %s"):format(where, m.cls, m.p, m.hash or "?"))
-    end
-end)
-
----------------------------------------------------------------------
--- 4. return ModuleScript yang sudah ke-load (dengan timeout)
----------------------------------------------------------------------
-phase("modules_return", CFG.DumpModuleReturn and getloadedmodules, function()
-    local w = newWriter("modules_return")
-    each(loadedList, function(m)
-        if CFG.DumpCore or not isCore(m) then
-            local ok, ret = withTimeout(require, CFG.RequireTimeout, m)
-            w.add("=== " .. path(m))
-            w.add(ok and ser(ret, CFG.MaxDepth, {}, "") or ("<require gagal: " .. tostring(ret) .. ">"))
-            w.add("")
-            counts.modules += 1
-        end
-    end)
-end)
-
----------------------------------------------------------------------
--- 5. environment script yang sedang jalan (getsenv)
----------------------------------------------------------------------
-phase("senv", CFG.DumpSenv and getsenv, function()
-    local w = newWriter("senv")
-    each(scriptList, function(s)
-        if (s:IsA("LocalScript") or loadedMods[s]) and (CFG.DumpCore or not isCore(s)) then
-            local ok, env = pcall(getsenv, s)
-            if ok and type(env) == "table" and next(env) ~= nil then
-                w.add("=== " .. path(s))
-                w.add(ser(env, 2, {}, ""))
-                w.add("")
-                counts.senv += 1
-            end
-        end
-    end)
-end)
-
----------------------------------------------------------------------
--- 6. garbage collector: fungsi game + tabel "sistem"
----------------------------------------------------------------------
-phase("gc", CFG.DumpGC and getgc, function()
-    local gc = getgc(true)
-    local isL = islclosure or function() return true end
-    local isExec = isexecutorclosure or function() return false end
-
-    -- tabel milik dumper sendiri jangan ikut kebaca
-    local ignore = {}
-    local function ig(t) if type(t) == "table" then ignore[t] = true end end
-    for _, t in ipairs({ CFG, CFG.GCKeywords, scriptList, scriptSet, remotes, loadedMods, loadedList,
-        counts, errors, timings, REMOTE_CLASSES, ownerCache, writers, ENV, _G, shared, RENV, gc }) do
-        ig(t)
-    end
-
-    local function scoreTable(tbl)
-        local nk, nf, kw = 0, 0, 0
-        local ok = pcall(function()
-            for k, val in next, tbl do
-                nk += 1
-                if type(val) == "function" then nf += 1 end
-                if type(k) == "string" then
-                    local lk = k:lower()
-                    for _, word in ipairs(CFG.GCKeywords) do
-                        if lk:find(word, 1, true) then
-                            kw += 1
-                            break
+        -- 1. instance tree + values + attributes
+        phase("instances", M.instances, function()
+            local list = INDEX.all
+            local total2 = #list
+            local wTree, wNil = W.new("instances"), W.new("nil_instances")
+            local wVals, wAttr = W.new("values"), W.new("attributes")
+            local classCount = {}
+            for i = 1, total2 do
+                U.pace()
+                local inst = list[i]
+                pcall(function()
+                    if inst == game or (APP.gui and inst:IsDescendantOf(APP.gui)) then return end
+                    if not SC.inst(inst) then return end
+                    local cls = inst.ClassName
+                    local intree = U.inGame(inst)
+                    local p = U.path(inst, intree)
+                    local w = intree and wTree or wNil
+                    w.add(("%-26s %s"):format(cls, p))
+                    if intree then counts.tree += 1 else counts.nil_ += 1 end
+                    classCount[cls] = (classCount[cls] or 0) + 1
+                    if inst:IsA("ValueBase") then
+                        local okv, val = pcall(function() return inst.Value end)
+                        wVals.add(("%-14s %s = %s"):format(cls, p, okv and U.ser(val, 2, {}, "") or "<?>"))
+                        counts.values += 1
+                    end
+                    local oka, attrs = pcall(inst.GetAttributes, inst)
+                    if oka and type(attrs) == "table" and next(attrs) ~= nil then
+                        wAttr.add(p)
+                        for k, val in next, attrs do
+                            wAttr.add(("    %s = %s"):format(tostring(k), U.ser(val, 2, {}, "    ")))
                         end
-                    end
-                end
-                if nk > 400 then break end
-            end
-        end)
-        if not ok then return 0, 0 end
-        return nk, nf * 2 + kw * 5
-    end
-
-    local byOwner, ownerKeys, cands = {}, {}, {}
-    local total = #gc
-
-    for i, v in ipairs(gc) do
-        pace()
-        local t = type(v)
-        if t == "function" then
-            if isL(v) and not isExec(v) then
-                local owner = ownerOf(v) or "<unknown>"
-                local core = owner:find("^CoreGui") or owner:find("^CorePackages")
-                    or owner:find("^%[NIL%] CoreGui") or owner:find("^%[NIL%] CorePackages")
-                if CFG.DumpCore or not core then
-                    local bucket = byOwner[owner]
-                    if not bucket then
-                        bucket = {}
-                        byOwner[owner] = bucket
-                        ownerKeys[#ownerKeys + 1] = owner
-                    end
-                    bucket[#bucket + 1] = v -- simpan referensi, string dibuat belakangan
-                end
-            end
-        elseif t == "table" and not ignore[v] then
-            local nk, score = scoreTable(v)
-            if nk >= 3 and score > 0 then
-                cands[#cands + 1] = { tbl = v, score = score, nk = nk }
-                if #cands > CFG.MaxGCTables * 4 then
-                    table.sort(cands, function(a, b) return a.score > b.score end)
-                    for j = #cands, CFG.MaxGCTables + 1, -1 do cands[j] = nil end
-                end
-            end
-        end
-        if i % 5000 == 0 then sub(i / total * 0.7, ("gc scan %d/%d"):format(i, total)) end
-    end
-
-    table.sort(ownerKeys)
-    local fw = newWriter("gc_functions")
-    for oi, owner in ipairs(ownerKeys) do
-        pace()
-        local b = byOwner[owner]
-        fw.add(("## %s (%d fungsi)"):format(owner, #b))
-        for j, f in ipairs(b) do
-            if j > CFG.MaxFuncsPerOwner then
-                fw.add(("  ... (+%d lagi)"):format(#b - j + 1))
-                break
-            end
-            fw.add("  " .. fnDesc(f, true) .. constSummary(f) .. upvalSummary(f))
-        end
-        counts.gcFuncs += #b
-        byOwner[owner] = nil
-        if oi % 20 == 0 then sub(0.7 + 0.2 * oi / #ownerKeys, "gc tulis fungsi") end
-    end
-    fw.close()
-
-    table.sort(cands, function(a, b) return a.score > b.score end)
-    local tw = newWriter("gc_tables")
-    for i = 1, math.min(#cands, CFG.MaxGCTables) do
-        pace()
-        local c = cands[i]
-        tw.add(("=== tabel #%d  (keys=%d score=%d)"):format(i, c.nk, c.score))
-        tw.add(ser(c.tbl, 3, {}, ""))
-        tw.add("")
-        counts.gcTables += 1
-    end
-end)
-
----------------------------------------------------------------------
--- 7. remote + handler client-nya (lengkap dengan const & upvalue handler)
----------------------------------------------------------------------
-phase("remotes", CFG.DumpRemotes, function()
-    local w = newWriter("remotes")
-    each(remotes, function(r)
-        local cls = r.ClassName
-        w.add(("[%s] %s"):format(cls, path(r)))
-        counts.remotes += 1
-
-        if getconnections then
-            local sig
-            if cls == "RemoteEvent" or cls == "UnreliableRemoteEvent" then
-                sig = r.OnClientEvent
-            elseif cls == "BindableEvent" then
-                sig = r.Event
-            end
-            if sig then
-                local ok, conns = pcall(getconnections, sig)
-                if ok and type(conns) == "table" then
-                    for _, c in ipairs(conns) do
-                        local okf, fn = pcall(function() return c.Function end)
-                        if okf and type(fn) == "function" then
-                            w.add("    handler: " .. fnDesc(fn) .. constSummary(fn) .. upvalSummary(fn))
-                        else
-                            w.add("    handler: <foreign/C>")
-                        end
-                    end
-                end
-            end
-        end
-
-        if cls == "RemoteFunction" and getcallbackvalue then
-            local ok, cb = pcall(getcallbackvalue, r, "OnClientInvoke")
-            if ok and type(cb) == "function" then
-                w.add("    OnClientInvoke: " .. fnDesc(cb) .. constSummary(cb) .. upvalSummary(cb))
-            end
-        end
-    end)
-end)
-
----------------------------------------------------------------------
--- 8. capture pasif panggilan remote (IN lewat OnClientEvent, OUT lewat __namecall)
---    Cuma MENCATAT. Hook tetap terpasang sebagai passthrough setelah selesai.
----------------------------------------------------------------------
-phase("capture", CFG.CaptureSeconds > 0, function()
-    local w = newWriter("remote_calls")
-    local log, n, capturing = {}, 0, true
-    local conns = {}
-    local t0 = os.clock()
-
-    for _, r in ipairs(remotes) do
-        local cls = r.ClassName
-        if cls == "RemoteEvent" or cls == "UnreliableRemoteEvent" then
-            local okc, c = pcall(function()
-                return r.OnClientEvent:Connect(function(...)
-                    if capturing and n < CFG.MaxCaptured then
-                        n += 1
-                        log[n] = { dir = "IN ", m = "OnClientEvent", inst = r, args = table.pack(...), t = os.clock() }
+                        counts.attrs += 1
                     end
                 end)
-            end)
-            if okc and c then conns[#conns + 1] = c end
-        end
-    end
-
-    local hookOK = false
-    if hookmetamethod and getnamecallmethod then
-        local SEND = { FireServer = true, InvokeServer = true, fireServer = true, invokeServer = true }
-        local wrap = newcclosure or function(f) return f end
-        local old
-        local okh = pcall(function()
-            old = hookmetamethod(game, "__namecall", wrap(function(self, ...)
-                local m = getnamecallmethod()
-                -- di dalam hook: kerja minimal, serialisasi dilakukan nanti
-                if capturing and SEND[m] and n < CFG.MaxCaptured and typeof(self) == "Instance"
-                    and not (checkcaller and checkcaller()) then
-                    n += 1
-                    log[n] = { dir = "OUT", m = m, inst = self, args = table.pack(...), t = os.clock() }
-                end
-                if setnamecallmethod then setnamecallmethod(m) end
-                return old(self, ...)
-            end))
+                if i % 2000 == 0 then sub(i / total2, ("instances %d/%d"):format(i, total2)) end
+            end
+            local rows = {}
+            for cls, n in next, classCount do rows[#rows + 1] = { cls, n } end
+            table.sort(rows, function(a, b) return a[2] > b[2] end)
+            local wc = W.new("class_stats")
+            for _, r in ipairs(rows) do wc.add(("%8d  %s"):format(r[2], r[1])) end
         end)
-        hookOK = okh and old ~= nil
+
+        -- 2. tags
+        phase("tags", M.tags, function()
+            local CS = svc("CollectionService")
+            local w = W.new("tags")
+            for _, tag in ipairs(CS:GetAllTags()) do
+                U.pace()
+                local items = CS:GetTagged(tag)
+                local keep = SC.str(tag)
+                if not keep then
+                    for i = 1, math.min(#items, 20) do
+                        if SC.inst(items[i]) then keep = true break end
+                    end
+                end
+                if keep then
+                    w.add(("## %s (%d)"):format(tag, #items))
+                    for i, inst in ipairs(items) do
+                        if i > 50 then w.add("  ...") break end
+                        w.add("  " .. U.path(inst))
+                    end
+                    counts.tags += 1
+                end
+            end
+        end)
+
+        -- 3. script + module (decompile paralel, dedup by hash)
+        phase("scripts", M.scripts, function()
+            for _, s in ipairs(INDEX.scripts) do addScript(s) end
+            if CAP.getscripts then
+                local okS, l = pcall(CAP.getscripts)
+                if okS then for _, s in ipairs(l) do addScript(s) end end
+            end
+            if CAP.getloadedmodules then
+                local okM, l = pcall(CAP.getloadedmodules)
+                if okM then
+                    for _, m in ipairs(l) do
+                        loadedMods[m] = true
+                        loadedList[#loadedList + 1] = m
+                        addScript(m)
+                    end
+                end
+            end
+
+            local meta, jobs, primaryOf = {}, {}, {}
+            for _, s in ipairs(scriptList) do
+                U.pace()
+                if (CFG.DumpCore or not U.isCore(s)) and SC.inst(s) then
+                    local i = #meta + 1
+                    local p = U.path(s)
+                    local hash
+                    if CAP.getscripthash then
+                        local okh, h = pcall(CAP.getscripthash, s)
+                        if okh and h then hash = tostring(h) end
+                    end
+                    local fname = ("%04d_%s.lua"):format(i, (p:gsub("[^%w_%.%-]", "_")):sub(-90))
+                    local m = { s = s, p = p, hash = hash, fname = fname, cls = s.ClassName }
+                    meta[i] = m
+                    local primary = hash and primaryOf[hash]
+                    if primary then
+                        m.dupOf = primary
+                        primary.copies = (primary.copies or 1) + 1
+                        counts.dups += 1
+                    else
+                        if hash then primaryOf[hash] = m end
+                        jobs[#jobs + 1] = m
+                    end
+                end
+            end
+
+            local function process(m)
+                local s = m.s
+                local body
+                if CFG.DecompileScripts and CAP.decompile then
+                    local okd, r = U.withTimeout(CAP.decompile, CFG.ScriptTimeout, s)
+                    if okd and type(r) == "string" and #r > 0 then
+                        body = r
+                    else
+                        body = "-- decompile gagal: " .. tostring(okd and "hasil kosong" or r) .. "\n" .. U.fallbackBody(s)
+                    end
+                else
+                    body = U.fallbackBody(s)
+                end
+                local extra = ""
+                pcall(function()
+                    if s:IsA("BaseScript") then
+                        extra = ("-- Enabled   : %s\n-- RunContext: %s\n"):format(tostring(s.Enabled), tostring(s.RunContext))
+                    end
+                end)
+                local header = ("-- Path      : %s\n-- Class     : %s\n-- Hash      : %s\n-- Loaded    : %s\n-- Copies    : %d\n%s\n"):format(
+                    m.p, m.cls, m.hash or "?", tostring(loadedMods[s] == true), m.copies or 1, extra)
+                CAP.writefile(ROOT .. "/scripts/" .. m.fname, header .. body)
+                if CFG.DumpBytecode and CAP.getscriptbytecode then
+                    local okb, bc = pcall(CAP.getscriptbytecode, s)
+                    if okb and type(bc) == "string" then
+                        pcall(CAP.writefile, ROOT .. "/bytecode/" .. (m.fname:gsub("%.lua$", ".bin")), bc)
+                    end
+                end
+            end
+
+            local N = math.max(1, CFG.DecompileWorkers)
+            local nextJob, finished, workersDone, totalJobs = 1, 0, 0, #jobs
+            local function worker()
+                while true do
+                    U.pace()
+                    local i = nextJob
+                    if i > totalJobs then return end
+                    nextJob = i + 1
+                    local job = jobs[i]
+                    local okp, e = pcall(process, job)
+                    if okp then
+                        counts.scripts += 1
+                    else
+                        errors[#errors + 1] = ("script %s: %s"):format(job.p, tostring(e))
+                    end
+                    finished += 1
+                    if finished % 5 == 0 then
+                        sub(finished / totalJobs, ("scripts %d/%d (dup dilewati: %d)"):format(finished, totalJobs, counts.dups))
+                    end
+                end
+            end
+            for _ = 1, N do
+                task.spawn(function()
+                    pcall(worker)
+                    workersDone += 1
+                end)
+            end
+            while workersDone < N do task.wait(0.1) end
+
+            local idx = W.new("scripts/_index")
+            for _, m in ipairs(meta) do
+                local where = m.dupOf and ("dup -> " .. m.dupOf.fname) or m.fname
+                idx.add(("%s | %s | %s | %s"):format(where, m.cls, m.p, m.hash or "?"))
+            end
+        end)
+
+        -- 4. return ModuleScript yang sudah ke-load
+        phase("modules_return", M.modules_return and CAP.getloadedmodules, function()
+            local w = W.new("modules_return")
+            U.each(loadedList, function(m)
+                if (CFG.DumpCore or not U.isCore(m)) and SC.inst(m) then
+                    local okr, ret = U.withTimeout(require, CFG.RequireTimeout, m)
+                    w.add("=== " .. U.path(m))
+                    w.add(okr and U.ser(ret, CFG.MaxDepth, {}, "") or ("<require gagal: " .. tostring(ret) .. ">"))
+                    w.add("")
+                    counts.modules += 1
+                end
+            end)
+        end)
+
+        -- 5. environment script yang sedang jalan
+        phase("senv", M.senv and CAP.getsenv, function()
+            local w = W.new("senv")
+            U.each(scriptList, function(s)
+                if (s:IsA("LocalScript") or loadedMods[s]) and (CFG.DumpCore or not U.isCore(s)) and SC.inst(s) then
+                    local oke, env = pcall(CAP.getsenv, s)
+                    if oke and type(env) == "table" and next(env) ~= nil then
+                        w.add("=== " .. U.path(s))
+                        w.add(U.ser(env, 2, {}, ""))
+                        w.add("")
+                        counts.senv += 1
+                    end
+                end
+            end)
+        end)
+
+        -- 6. garbage collector
+        phase("gc", M.gc and CAP.getgc, function()
+            local gc = CAP.getgc(true)
+            local isL = CAP.islclosure or function() return true end
+            local isExec = CAP.isexecutorclosure or function() return false end
+            local keywords = scoped and SC.keywords() or CFG.GCKeywords
+            if #keywords == 0 then keywords = CFG.GCKeywords end
+
+            local ignore = {}
+            for _, t in ipairs({ CFG, CFG.GCKeywords, keywords, INDEX, INDEX.all, INDEX.remotes, INDEX.scripts, INDEX.values,
+                INDEX.attrs, SCAN, W, W.files, W.all, LOG, LOG.lines, KW, NAME_MEMO, scriptList, scriptSet, loadedMods,
+                loadedList, counts, errors, timings, ENV, _G, shared, RENV, gc, APP, CAP }) do
+                if type(t) == "table" then ignore[t] = true end
+            end
+
+            local function scoreTable(tbl)
+                local nk, nf, kw = 0, 0, 0
+                local okk = pcall(function()
+                    for k, val in next, tbl do
+                        nk += 1
+                        if type(val) == "function" then nf += 1 end
+                        if type(k) == "string" then
+                            local lk = k:lower()
+                            for _, word in ipairs(keywords) do
+                                if lk:find(word, 1, true) then
+                                    kw += 1
+                                    break
+                                end
+                            end
+                        end
+                        if nk > 400 then break end
+                    end
+                end)
+                if not okk then return 0, 0 end
+                return nk, nf * 2 + kw * 5
+            end
+
+            local byOwner, ownerKeys, cands = {}, {}, {}
+            local totalGC = #gc
+            for i, v in ipairs(gc) do
+                U.pace()
+                local t = type(v)
+                if t == "function" then
+                    if isL(v) and not isExec(v) then
+                        local owner = U.ownerOf(v) or "<unknown>"
+                        local core = owner:find("^CoreGui") or owner:find("^CorePackages")
+                            or owner:find("^%[NIL%] CoreGui") or owner:find("^%[NIL%] CorePackages")
+                        if (CFG.DumpCore or not core) and (not scoped or (owner ~= "<unknown>" and SC.str(owner))) then
+                            local bucket = byOwner[owner]
+                            if not bucket then
+                                bucket = {}
+                                byOwner[owner] = bucket
+                                ownerKeys[#ownerKeys + 1] = owner
+                            end
+                            bucket[#bucket + 1] = v
+                        end
+                    end
+                elseif t == "table" and not ignore[v] then
+                    local nk, score = scoreTable(v)
+                    if nk >= 3 and score > 0 then
+                        cands[#cands + 1] = { tbl = v, score = score, nk = nk }
+                        if #cands > CFG.MaxGCTables * 4 then
+                            table.sort(cands, function(a, b) return a.score > b.score end)
+                            for j = #cands, CFG.MaxGCTables + 1, -1 do cands[j] = nil end
+                        end
+                    end
+                end
+                if i % 5000 == 0 then sub(i / totalGC * 0.7, ("gc scan %d/%d"):format(i, totalGC)) end
+            end
+
+            table.sort(ownerKeys)
+            local fw = W.new("gc_functions")
+            for oi, owner in ipairs(ownerKeys) do
+                U.pace()
+                local b = byOwner[owner]
+                fw.add(("## %s (%d fungsi)"):format(owner, #b))
+                for j, f in ipairs(b) do
+                    if j > CFG.MaxFuncsPerOwner then
+                        fw.add(("  ... (+%d lagi)"):format(#b - j + 1))
+                        break
+                    end
+                    fw.add("  " .. U.fnDesc(f, true) .. U.constSummary(f) .. U.upvalSummary(f))
+                end
+                counts.gcFuncs += #b
+                byOwner[owner] = nil
+                if oi % 20 == 0 then sub(0.7 + 0.2 * oi / #ownerKeys, "gc tulis fungsi") end
+            end
+            fw.close()
+
+            table.sort(cands, function(a, b) return a.score > b.score end)
+            local tw = W.new("gc_tables")
+            for i = 1, math.min(#cands, CFG.MaxGCTables) do
+                U.pace()
+                local c = cands[i]
+                tw.add(("=== tabel #%d  (keys=%d score=%d)"):format(i, c.nk, c.score))
+                tw.add(U.ser(c.tbl, 3, {}, ""))
+                tw.add("")
+                counts.gcTables += 1
+            end
+        end)
+
+        -- 7. remote + handler client-nya
+        phase("remotes", M.remotes, function()
+            local w = W.new("remotes")
+            U.each(INDEX.remotes, function(r)
+                if not SC.inst(r) then return end
+                local cls = r.ClassName
+                w.add(("[%s] %s"):format(cls, U.path(r)))
+                counts.remotes += 1
+                if CAP.getconnections then
+                    local sig
+                    if cls == "RemoteEvent" or cls == "UnreliableRemoteEvent" then
+                        sig = r.OnClientEvent
+                    elseif cls == "BindableEvent" then
+                        sig = r.Event
+                    end
+                    if sig then
+                        local okc, conns = pcall(CAP.getconnections, sig)
+                        if okc and type(conns) == "table" then
+                            for _, c in ipairs(conns) do
+                                local okf, fn = pcall(function() return c.Function end)
+                                if okf and type(fn) == "function" then
+                                    w.add("    handler: " .. U.fnDesc(fn) .. U.constSummary(fn) .. U.upvalSummary(fn))
+                                else
+                                    w.add("    handler: <foreign/C>")
+                                end
+                            end
+                        end
+                    end
+                end
+                if cls == "RemoteFunction" and CAP.getcallbackvalue then
+                    local okb, cb = pcall(CAP.getcallbackvalue, r, "OnClientInvoke")
+                    if okb and type(cb) == "function" then
+                        w.add("    OnClientInvoke: " .. U.fnDesc(cb) .. U.constSummary(cb) .. U.upvalSummary(cb))
+                    end
+                end
+            end)
+        end)
+
+        -- 8. saveinstance bawaan executor
+        phase("saveinstance", M.saveinstance and CAP.saveinstance, function()
+            CAP.saveinstance({ FileName = "DumpPP_" .. W.gname, NilInstances = true, DecompileScripts = true })
+        end)
+    end)
+    if not ok then
+        errors[#errors + 1] = "dump: " .. tostring(err)
+        LOG.add(err == "dihentikan" and "warn" or "error", "dump berhenti: " .. tostring(err))
     end
 
-    local total = CFG.CaptureSeconds
-    while os.clock() - t0 < total do
-        if ENV.DumperPP_Stop then break end
-        local left = math.max(0, math.floor(total - (os.clock() - t0)))
-        sub((os.clock() - t0) / total, ("capture %ds lagi | %d panggilan"):format(left, n))
-        task.wait(0.25)
-    end
-    capturing = false
-    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    -- info + manifest + error log
+    pcall(function()
+        local capMap, caps = {}, {}
+        for _, n in ipairs(CAPLIST) do
+            capMap[n] = CAP[n] ~= nil
+            caps[#caps + 1] = ("  %-18s %s"):format(n, CAP[n] and "ada" or "TIDAK ADA")
+        end
+        local I = SCAN.info
+        local info = {
+            "Dumper++ : v" .. VERSION, "PlaceId  : " .. tostring(game.PlaceId), "GameId   : " .. tostring(game.GameId),
+            "JobId    : " .. tostring(game.JobId), "Versi    : " .. tostring(game.PlaceVersion),
+            "Game     : " .. W.gname, "Waktu    : " .. os.date("%Y-%m-%d %H:%M:%S"), "Executor : " .. tostring(I.executor),
+            "Scope    : " .. (scoped and table.concat(selNames, ", ") or "seluruh game"),
+            "Sistem   : " .. (function()
+                local n = {}
+                for _, s in ipairs(SCAN.systems) do n[#n + 1] = ("%s(%d)"):format(s.id, s.score) end
+                return table.concat(n, ", ")
+            end)(),
+            "Framework: " .. table.concat(SCAN.frameworks, ", "), "",
+        }
+        for k, v in next, counts do info[#info + 1] = ("%-12s : %d"):format(k, v) end
+        info[#info + 1] = ""
+        info[#info + 1] = "Durasi fase (detik):"
+        for n, t in next, timings do info[#info + 1] = ("  %-16s %s"):format(n, tostring(t)) end
+        info[#info + 1] = ""
+        info[#info + 1] = "Kemampuan executor:"
+        info[#info + 1] = table.concat(caps, "\n")
+        CAP.writefile(ROOT .. "/_info.txt", table.concat(info, "\n"))
 
-    if not hookOK then w.add("-- hookmetamethod/getnamecallmethod tidak tersedia: hanya capture IN") end
-    for _, e in ipairs(log) do
-        pace()
-        w.add(("[%s] %-12s %s  (+%.2fs)"):format(e.dir, e.m, path(e.inst), e.t - t0))
-        for i = 1, e.args.n do
-            w.add(("    arg%d = %s"):format(i, ser(e.args[i], 3, {}, "    ")))
+        if HttpService then
+            CAP.writefile(ROOT .. "/manifest.json", HttpService:JSONEncode({
+                version = VERSION, placeId = game.PlaceId, gameId = game.GameId, placeVersion = game.PlaceVersion,
+                game = W.gname, executor = I.executor, scope = scoped and selNames or "all",
+                systems = SCAN.systems, frameworks = SCAN.frameworks, scanInfo = I, counts = counts,
+                timings = timings, capabilities = capMap, errors = errors,
+            }))
+        end
+        if #errors > 0 then CAP.writefile(ROOT .. "/_errors.txt", table.concat(errors, "\n")) end
+    end)
+    W.flushAll()
+
+    D.status(APP.cancel and "dihentikan -> workspace/" .. ROOT or "selesai -> workspace/" .. ROOT, 1)
+    if CAP.setclipboard then pcall(CAP.setclipboard, "workspace/" .. ROOT) end
+    D.running, APP.cancel = false, false
+end
+
+---------------------------------------------------------------------
+-- 5. LIVE MONITOR (remote IN/OUT, value, attribute, instance) + log file realtime
+---------------------------------------------------------------------
+local L = {
+    on = false, q = {}, qh = 0, qt = 0, dropped = 0, conns = {}, feed = {}, stats = {},
+    muted = {}, win = {}, winT = 0, watched = setmetatable({}, { __mode = "k" }),
+    hooked = setmetatable({}, { __mode = "k" }), last = setmetatable({}, { __mode = "k" }),
+    pathMemo = setmetatable({}, { __mode = "k" }), watchN = 0, epoch = os.time() - os.clock(),
+}
+
+local SEND = { FireServer = true, InvokeServer = true, fireServer = true, invokeServer = true }
+local LIVE_CLASS = {
+    Model = true, Tool = true, Folder = true, Configuration = true, ScreenGui = true, ModuleScript = true,
+    LocalScript = true, Script = true, Humanoid = true, ProximityPrompt = true, ClickDetector = true,
+}
+for c, k in next, KIND do if k == "remote" or k == "value" then LIVE_CLASS[c] = true end end
+
+local function ensureHook()
+    if ENV.DumperPP_HookInstalled then return true end
+    if not (CAP.hookmetamethod and CAP.getnamecallmethod) then return false end
+    local wrap = CAP.newcclosure or function(f) return f end
+    local old
+    local ok = pcall(function()
+        old = CAP.hookmetamethod(game, "__namecall", wrap(function(self, ...)
+            local sink = ENV.DumperPP_Sink
+            if sink then
+                local m = CAP.getnamecallmethod()
+                if SEND[m] then sink(self, m, ...) end
+                if CAP.setnamecallmethod then CAP.setnamecallmethod(m) end
+            end
+            return old(self, ...)
+        end))
+    end)
+    if ok and old then
+        ENV.DumperPP_HookInstalled = true
+        return true
+    end
+    return false
+end
+
+local function qpush(item)
+    if L.qt - L.qh >= CFG.LiveQueueMax then
+        L.dropped += 1
+        return
+    end
+    L.qt += 1
+    L.q[L.qt] = item
+end
+
+-- dipanggil dari dalam hook: kerja minimal, serialisasi dilakukan di loop
+function L.sink(self, m, ...)
+    if typeof(self) ~= "Instance" then return end
+    if not CFG.LiveIncludeExecutor and CAP.checkcaller and CAP.checkcaller() then return end
+    qpush({ "OUT", m, self, table.pack(...), os.clock() })
+end
+
+function L.hookIn(r)
+    if L.hooked[r] then return end
+    local cls = r.ClassName
+    if cls ~= "RemoteEvent" and cls ~= "UnreliableRemoteEvent" then return end
+    L.hooked[r] = true
+    local okc, c = pcall(function()
+        return r.OnClientEvent:Connect(function(...)
+            qpush({ "IN ", "OnClientEvent", r, table.pack(...), os.clock() })
+        end)
+    end)
+    if okc and c then L.conns[#L.conns + 1] = c end
+end
+
+function L.watchValue(v)
+    if L.watched[v] or L.watchN >= CFG.LiveMaxWatch or not SC.inst(v) then return end
+    local ok, cur = pcall(function() return v.Value end)
+    if not ok then return end
+    L.watched[v], L.last[v] = true, cur
+    L.watchN += 1
+    local c = v.Changed:Connect(function(new)
+        local old = L.last[v]
+        L.last[v] = new
+        qpush({ "VAL", "Value", v, { old, new, n = 2 }, os.clock() })
+    end)
+    L.conns[#L.conns + 1] = c
+end
+
+function L.watchAttr(inst)
+    if L.watched[inst] or L.watchN >= CFG.LiveMaxWatch or not SC.inst(inst) then return end
+    local ok, snap = pcall(inst.GetAttributes, inst)
+    if not ok or type(snap) ~= "table" then return end
+    L.watched[inst], L.last[inst] = true, snap
+    L.watchN += 1
+    local c = inst.AttributeChanged:Connect(function(name)
+        local new = inst:GetAttribute(name)
+        local s = L.last[inst]
+        local old = s[name]
+        s[name] = new
+        qpush({ "ATR", name, inst, { old, new, n = 2 }, os.clock() })
+    end)
+    L.conns[#L.conns + 1] = c
+end
+
+function L.onAdded(d)
+    local cls = d.ClassName
+    if not LIVE_CLASS[cls] then return end
+    local o = CFG.Live
+    local kind = KIND[cls]
+    if o.remotes and kind == "remote" then L.hookIn(d) end
+    if o.values and kind == "value" then L.watchValue(d) end
+    if o.instances then qpush({ "ADD", cls, d, { cls, n = 1 }, os.clock() }) end
+end
+function L.onRemoving(d)
+    local cls = d.ClassName
+    if LIVE_CLASS[cls] then qpush({ "DEL", cls, d, { cls, n = 1 }, os.clock() }) end
+end
+
+local function oneLine(s, n)
+    s = s:gsub("%s*\n%s*", " ")
+    return #s > n and (s:sub(1, n) .. "...") or s
+end
+
+function L.emit(kind, line, detail, j, t)
+    local wall = L.epoch + t
+    local stamp = ("%s.%03d"):format(os.date("%H:%M:%S", math.floor(wall)), math.floor((wall % 1) * 1000))
+    local text = ("%s [%s] %s"):format(stamp, kind, line)
+    if L.wLog then
+        L.wLog.add(text)
+        if detail and detail ~= "" then L.wLog.add("    " .. detail:gsub("\n", "\n    ")) end
+    end
+    if L.wJson and HttpService and j then
+        j.t, j.kind = math.floor(wall * 1000) / 1000, kind
+        local ok, enc = pcall(HttpService.JSONEncode, HttpService, j)
+        if ok then L.wJson.add(enc) end
+    end
+    L.stats[kind] = (L.stats[kind] or 0) + 1
+    if #L.feed < 600 then L.feed[#L.feed + 1] = { kind = kind, line = text, detail = detail or text } end
+end
+
+function L.process(it)
+    local kind, name, inst, args, t = it[1], it[2], it[3], it[4], it[5]
+    if not SC.inst(inst) then return end
+    local p = L.pathMemo[inst]
+    if not p then
+        p = U.path(inst)
+        L.pathMemo[inst] = p
+    end
+    local key = kind .. p .. (kind == "ATR" and name or "")
+    if L.muted[key] then return end
+    local c = (L.win[key] or 0) + 1
+    L.win[key] = c
+    if c > CFG.LiveSpamPerSec then
+        L.muted[key] = true
+        L.emit("NOTE", ("auto-mute (>%d/detik): %s"):format(CFG.LiveSpamPerSec, p), nil, nil, t)
+        return
+    end
+
+    local parts = {}
+    local depth = (kind == "OUT" or kind == "IN ") and CFG.LiveArgDepth or 2
+    for i = 1, args.n do parts[i] = U.ser(args[i], depth, {}, "") end
+
+    if kind == "OUT" or kind == "IN " then
+        L.emit(kind, ("%-12s %s  %s"):format(name, p, oneLine(table.concat(parts, ", "), 140)),
+            p .. "\n" .. table.concat(parts, "\n"), { dir = kind, method = name, path = p, args = parts }, t)
+    elseif kind == "VAL" then
+        L.emit(kind, ("%s: %s -> %s"):format(p, oneLine(parts[1], 60), oneLine(parts[2], 60)), nil,
+            { path = p, old = parts[1], new = parts[2] }, t)
+    elseif kind == "ATR" then
+        L.emit(kind, ("%s @%s: %s -> %s"):format(p, name, oneLine(parts[1], 60), oneLine(parts[2], 60)), nil,
+            { path = p, attr = name, old = parts[1], new = parts[2] }, t)
+    else
+        L.emit(kind, ("%s (%s)"):format(p, name), nil, { path = p, class = name }, t)
+    end
+end
+
+function L.loop()
+    local lastFlush = os.clock()
+    while L.on and not APP.dead do
+        task.wait(0.12)
+        if os.clock() - L.winT >= 1 then L.win, L.winT = {}, os.clock() end
+        local t0 = os.clock()
+        while L.qh < L.qt and os.clock() - t0 < 0.01 do
+            L.qh += 1
+            local it = L.q[L.qh]
+            L.q[L.qh] = nil
+            pcall(L.process, it)
+        end
+        if L.qh >= L.qt then L.qh, L.qt = 0, 0 end
+        if os.clock() - lastFlush >= CFG.LiveFlushSec then
+            lastFlush = os.clock()
+            if L.wLog then L.wLog.close() end
+            if L.wJson then L.wJson.close() end
         end
     end
-    counts.captured = n
-end)
-
----------------------------------------------------------------------
--- 9. saveinstance bawaan executor (opsi beda-beda tiap executor)
----------------------------------------------------------------------
-phase("saveinstance", CFG.SaveInstance and saveinstance, function()
-    saveinstance({ FileName = "DumpPP_" .. gname, NilInstances = true, DecompileScripts = true })
-end)
-
----------------------------------------------------------------------
--- info + manifest + error log
----------------------------------------------------------------------
-local want = {
-    "getinstances", "getnilinstances", "getscripts", "getloadedmodules", "decompile",
-    "getscriptclosure", "getscripthash", "getscriptbytecode", "getgc", "getconnections",
-    "getcallbackvalue", "getsenv", "getrawmetatable", "islclosure", "isexecutorclosure",
-    "hookmetamethod", "getnamecallmethod", "cloneref", "gethui", "saveinstance",
-}
-local caps, capMap = {}, {}
-for _, n in ipairs(want) do
-    local has = ENV[n] ~= nil
-    capMap[n] = has
-    caps[#caps + 1] = ("  %-18s %s"):format(n, has and "ada" or "TIDAK ADA")
+    if L.wLog then L.wLog.close() end
+    if L.wJson then L.wJson.close() end
 end
 
-local execName = "?"
-if ENV.identifyexecutor then
-    local ok, n = pcall(ENV.identifyexecutor)
-    if ok then execName = tostring(n) end
+function L.start()
+    if L.on then return end
+    if not SCAN.done then LOG.add("warn", "scan belum selesai") return end
+    L.on, L.epoch = true, os.time() - os.clock()
+    L.q, L.qh, L.qt, L.dropped, L.stats, L.feed = {}, 0, 0, 0, {}, {}
+    L.muted, L.win, L.winT, L.watchN = {}, {}, os.clock(), 0
+    L.wLog, L.wJson = nil, nil
+    if CAN_WRITE then
+        L.wLog = W.new("events", "log", "live")
+        L.wJson = (CFG.LiveJSONL and HttpService) and W.new("events", "jsonl", "live") or nil
+    else
+        LOG.add("warn", "tanpa writefile: live tidak disimpan ke file (hanya tampil di UI)")
+    end
+    local o = CFG.Live
+    if o.remotes then
+        ENV.DumperPP_Sink = L.sink
+        if not ensureHook() then LOG.add("warn", "hookmetamethod tidak tersedia: live hanya menangkap remote IN") end
+        for _, r in ipairs(INDEX.remotes) do L.hookIn(r) end
+    end
+    if o.values then
+        for _, v in ipairs(INDEX.values) do L.watchValue(v) end
+        for _, a in ipairs(INDEX.attrs) do L.watchAttr(a) end
+    end
+    L.conns[#L.conns + 1] = game.DescendantAdded:Connect(L.onAdded)
+    if o.instances then L.conns[#L.conns + 1] = game.DescendantRemoving:Connect(L.onRemoving) end
+    task.spawn(L.loop)
+    LOG.add("info", ("live aktif | scope: %s | diawasi: %d | log: %s/live"):format(
+        SC.active() and "sistem terpilih" or "seluruh game", L.watchN, W.root or "-"))
 end
 
-local info = {
-    "Dumper++ : v" .. VERSION,
-    "PlaceId  : " .. tostring(game.PlaceId),
-    "GameId   : " .. tostring(game.GameId),
-    "JobId    : " .. tostring(game.JobId),
-    "Versi    : " .. tostring(game.PlaceVersion),
-    "Game     : " .. gname,
-    "Waktu    : " .. os.date("%Y-%m-%d %H:%M:%S"),
-    "Executor : " .. execName,
-    "",
-    ("instance di tree : %d"):format(counts.tree),
-    ("instance NIL     : %d"):format(counts.nil_),
-    ("value objects    : %d"):format(counts.values),
-    ("instance attr    : %d"):format(counts.attrs),
-    ("tags             : %d"):format(counts.tags),
-    ("script ditulis   : %d"):format(counts.scripts),
-    ("script duplikat  : %d (dilewati, sama hash)"):format(counts.dups),
-    ("module di-dump   : %d"):format(counts.modules),
-    ("senv di-dump     : %d"):format(counts.senv),
-    ("remote           : %d"):format(counts.remotes),
-    ("fungsi GC        : %d"):format(counts.gcFuncs),
-    ("tabel GC         : %d"):format(counts.gcTables),
-    ("remote captured  : %d"):format(counts.captured),
-    "",
-    "Durasi fase (detik):",
-}
-for name, t in next, timings do info[#info + 1] = ("  %-16s %s"):format(name, tostring(t)) end
-info[#info + 1] = ""
-info[#info + 1] = "Kemampuan executor:"
-info[#info + 1] = table.concat(caps, "\n")
-writefile(ROOT .. "/_info.txt", table.concat(info, "\n"))
+function L.stop()
+    if not L.on then return end
+    L.on = false
+    ENV.DumperPP_Sink = nil
+    for _, c in ipairs(L.conns) do pcall(function() c:Disconnect() end) end
+    L.conns, L.hooked, L.watched = {}, setmetatable({}, { __mode = "k" }), setmetatable({}, { __mode = "k" })
+    task.delay(0.3, function() W.flushAll() end)
+    LOG.add("info", "live dihentikan, log tersimpan")
+end
+onCleanup(function() L.on = false end)
+onCleanup(function() for _, c in ipairs(L.conns) do pcall(function() c:Disconnect() end) end end)
 
-if HttpService then
+---------------------------------------------------------------------
+-- 6. UI (dibangun dari hasil scan)
+---------------------------------------------------------------------
+local T = {
+    bg = Color3.fromRGB(16, 17, 23), panel = Color3.fromRGB(25, 27, 37), panel2 = Color3.fromRGB(36, 39, 52),
+    text = Color3.fromRGB(232, 234, 244), dim = Color3.fromRGB(140, 146, 165), off = Color3.fromRGB(58, 62, 78),
+    accent = Color3.fromRGB(90, 220, 140), blue = Color3.fromRGB(95, 160, 255), warn = Color3.fromRGB(245, 180, 80),
+    bad = Color3.fromRGB(235, 100, 110),
+}
+local KIND_COLOR = {
+    ["OUT"] = Color3.fromRGB(245, 170, 90), ["IN "] = T.blue, VAL = T.accent, ATR = Color3.fromRGB(90, 210, 210),
+    ADD = Color3.fromRGB(190, 140, 255), DEL = T.bad, NOTE = T.warn,
+}
+
+local UI = {}
+local ORD = setmetatable({}, { __mode = "k" })
+local function ordered(parent, o)
+    ORD[parent] = (ORD[parent] or 0) + 1
+    o.LayoutOrder = ORD[parent]
+    return o
+end
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in next, props or {} do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function corner(o, r) return new("UICorner", { CornerRadius = UDim.new(0, r or 6) }, o) end
+local function label(parent, txt, props)
+    local p = {
+        BackgroundTransparency = 1, Text = txt, Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true,
+    }
+    for k, v in next, props or {} do p[k] = v end
+    return new("TextLabel", p, parent)
+end
+local function button(parent, txt, cb, props)
+    local p = {
+        Text = txt, Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = T.text,
+        BackgroundColor3 = T.panel2, BorderSizePixel = 0, AutoButtonColor = true,
+    }
+    for k, v in next, props or {} do p[k] = v end
+    local b = new("TextButton", p, parent)
+    corner(b, 6)
+    b.Activated:Connect(function()
+        local ok, err = pcall(cb, b)
+        if not ok then LOG.add("error", "ui: " .. tostring(err)) end
+    end)
+    return b
+end
+local function section(parent, txt)
+    return ordered(parent, label(parent, txt, {
+        Size = UDim2.new(1, 0, 0, 18), TextSize = 12, TextColor3 = T.dim, Font = Enum.Font.GothamBold,
+    }))
+end
+local function toggle(parent, txt, get, set, supported)
+    local b = ordered(parent, new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = T.panel, Text = "", AutoButtonColor = false, BorderSizePixel = 0,
+    }, parent))
+    corner(b)
+    local l = label(b, txt .. (supported == false and "  (tidak didukung)" or ""),
+        { Size = UDim2.new(1, -56, 1, 0), Position = UDim2.new(0, 10, 0, 0), TextWrapped = false })
+    local pill = new("Frame", { Size = UDim2.fromOffset(34, 18), Position = UDim2.new(1, -44, 0.5, -9), BackgroundColor3 = T.off, BorderSizePixel = 0 }, b)
+    corner(pill, 9)
+    local dot = new("Frame", { Size = UDim2.fromOffset(14, 14), Position = UDim2.fromOffset(2, 2), BackgroundColor3 = T.text, BorderSizePixel = 0 }, pill)
+    corner(dot, 7)
+    local function paint()
+        local on = get() and supported ~= false
+        pill.BackgroundColor3 = on and T.accent or T.off
+        dot.Position = on and UDim2.fromOffset(18, 2) or UDim2.fromOffset(2, 2)
+        l.TextColor3 = supported == false and T.dim or T.text
+    end
+    paint()
+    b.Activated:Connect(function()
+        if supported == false then return end
+        set(not get())
+        paint()
+        saveSettings()
+    end)
+    return b
+end
+local function scrollPage(parent)
+    local sf = new("ScrollingFrame", {
+        Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 3,
+        CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Visible = false,
+    }, parent)
+    new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, sf)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8) }, sf)
+    return sf
+end
+
+-- splash kecil selama scan
+local splash = {}
+function UI.splash()
     pcall(function()
-        writefile(ROOT .. "/manifest.json", HttpService:JSONEncode({
-            version = VERSION,
-            placeId = game.PlaceId,
-            gameId = game.GameId,
-            placeVersion = game.PlaceVersion,
-            game = gname,
-            executor = execName,
-            counts = counts,
-            timings = timings,
-            capabilities = capMap,
-            errors = errors,
-        }))
+        local gui = new("ScreenGui", { Name = HttpService and HttpService:GenerateGUID(false) or "DumperPP", ResetOnSpawn = false, DisplayOrder = 2147483647 })
+        local f = new("Frame", { Size = UDim2.fromOffset(300, 46), Position = UDim2.new(0.5, -150, 0, 24), BackgroundColor3 = T.bg, BorderSizePixel = 0 }, gui)
+        corner(f, 8)
+        splash.label = label(f, "Dumper++ v" .. VERSION .. " | scanning map...", { Size = UDim2.new(1, -16, 0, 22), Position = UDim2.fromOffset(8, 3), Font = Enum.Font.Code, TextWrapped = false })
+        local bar = new("Frame", { Size = UDim2.new(1, -16, 0, 6), Position = UDim2.new(0, 8, 1, -12), BackgroundColor3 = T.off, BorderSizePixel = 0 }, f)
+        splash.fill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.accent, BorderSizePixel = 0 }, bar)
+        splash.gui = gui
+        gui.Parent = (CAP.gethui and CAP.gethui()) or CoreGui
     end)
 end
-
-if #errors > 0 then
-    writefile(ROOT .. "/_errors.txt", table.concat(errors, "\n"))
+function UI.splashSet(frac, text)
+    if splash.label and text then splash.label.Text = "Dumper++ | " .. text end
+    if splash.fill then splash.fill.Size = UDim2.new(math.clamp(frac or 0, 0, 1), 0, 1, 0) end
 end
 
-status("selesai -> workspace/" .. ROOT, 1)
-if ENV.setclipboard then pcall(ENV.setclipboard, "workspace/" .. ROOT) end
-ENV.DumperPP_Running = nil
-task.delay(8, function()
-    if ui.gui then pcall(function() ui.gui:Destroy() end) end
+function UI.build()
+    if splash.gui then pcall(function() splash.gui:Destroy() end) end
+    local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
+    local WW, HH = math.min(440, vp.X - 20), math.min(520, vp.Y - 40)
+
+    local gui = new("ScreenGui", { Name = HttpService and HttpService:GenerateGUID(false) or "DumperPP", ResetOnSpawn = false, DisplayOrder = 2147483647, IgnoreGuiInset = true })
+    APP.gui = gui
+    onCleanup(function() pcall(function() gui:Destroy() end) end)
+
+    local main = new("Frame", { Size = UDim2.fromOffset(WW, HH), Position = UDim2.new(0.5, -WW / 2, 0.5, -HH / 2), BackgroundColor3 = T.bg, BorderSizePixel = 0, ClipsDescendants = true }, gui)
+    corner(main, 10)
+    new("UIStroke", { Color = T.panel2, Thickness = 1 }, main)
+
+    -- title bar (drag)
+    local title = new("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = T.panel, BorderSizePixel = 0 }, main)
+    label(title, ("Dumper++ v%s  Atlas"):format(VERSION), { Size = UDim2.new(1, -90, 1, 0), Position = UDim2.fromOffset(12, 0), Font = Enum.Font.GothamBold, TextSize = 14, TextWrapped = false })
+    local collapsed = false
+    local body = new("Frame", { Size = UDim2.new(1, 0, 1, -34), Position = UDim2.fromOffset(0, 34), BackgroundTransparency = 1 }, main)
+    button(title, "-", function()
+        collapsed = not collapsed
+        body.Visible = not collapsed
+        main.Size = collapsed and UDim2.fromOffset(WW, 34) or UDim2.fromOffset(WW, HH)
+    end, { Size = UDim2.fromOffset(28, 22), Position = UDim2.new(1, -66, 0.5, -11), BackgroundColor3 = T.panel2 })
+    button(title, "x", function() APP.Destroy() end, { Size = UDim2.fromOffset(28, 22), Position = UDim2.new(1, -34, 0.5, -11), BackgroundColor3 = T.bad })
+
+    local dragging, dragStart, startPos
+    title.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, main.Position
+            i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then dragging = false end end)
+        end
+    end)
+    if UIS then
+        local c1 = UIS.InputChanged:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+                local d = i.Position - dragStart
+                main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end)
+        local c2 = UIS.InputBegan:Connect(function(i, gp)
+            if gp then return end
+            local okk, kc = pcall(function() return Enum.KeyCode[CFG.UIKey] end)
+            if okk and i.KeyCode == kc then gui.Enabled = not gui.Enabled end
+        end)
+        onCleanup(function() c1:Disconnect() c2:Disconnect() end)
+    end
+
+    -- tab bar + content + status bar
+    local tabs = new("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundTransparency = 1 }, body)
+    new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, tabs)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 4) }, tabs)
+    local content = new("Frame", { Size = UDim2.new(1, 0, 1, -72), Position = UDim2.fromOffset(0, 30), BackgroundTransparency = 1 }, body)
+    local bar = new("Frame", { Size = UDim2.new(1, 0, 0, 42), Position = UDim2.new(0, 0, 1, -42), BackgroundColor3 = T.panel, BorderSizePixel = 0 }, body)
+    local statusLbl = label(bar, "siap", { Size = UDim2.new(1, -16, 0, 22), Position = UDim2.fromOffset(8, 3), Font = Enum.Font.Code, TextSize = 12, TextWrapped = false })
+    local pbg = new("Frame", { Size = UDim2.new(1, -16, 0, 6), Position = UDim2.new(0, 8, 1, -12), BackgroundColor3 = T.off, BorderSizePixel = 0 }, bar)
+    local pfill = new("Frame", { Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = T.accent, BorderSizePixel = 0 }, pbg)
+    local function setStatus(text, frac, color)
+        statusLbl.Text = tostring(text)
+        statusLbl.TextColor3 = color or T.text
+        if frac then pfill.Size = UDim2.new(math.clamp(frac, 0, 1), 0, 1, 0) end
+    end
+    D.onStatus = function(text, frac) setStatus(text, frac) end
+
+    local pages, tabBtns = {}, {}
+    local function showPage(name)
+        for n, p in next, pages do p.Visible = (n == name) end
+        for n, b in next, tabBtns do b.BackgroundColor3 = (n == name) and T.accent or T.panel2; b.TextColor3 = (n == name) and T.bg or T.text end
+    end
+    local function addTab(name, txt, page)
+        pages[name] = page
+        local b = button(tabs, txt, function() showPage(name) end, { Size = UDim2.new(0.25, -3, 1, -4), TextSize = 12 })
+        b.LayoutOrder = #tabs:GetChildren()
+        tabBtns[name] = b
+    end
+
+    -------------------------------------------------- Overview
+    local ov = scrollPage(content)
+    local infoLbl = ordered(ov, label(ov, "", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, RichText = true, Font = Enum.Font.Code, TextSize = 12 }))
+    local fwLbl = ordered(ov, label(ov, "", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, RichText = true, TextSize = 12 }))
+    local capLbl = ordered(ov, label(ov, "", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, RichText = true, TextSize = 11 }))
+    local doRescan
+
+    -------------------------------------------------- Dump
+    local dp = scrollPage(content)
+    local scopeLbl = label(dp, "", { Size = UDim2.new(1, 0, 0, 30), Font = Enum.Font.GothamMedium })
+    scopeLbl.LayoutOrder = 0
+    local sysBox
+    local function refreshScope()
+        local names = {}
+        for id in next, SC.sel do names[#names + 1] = (id == "custom") and ("kustom:" .. table.concat(customToks, "/")) or id end
+        table.sort(names)
+        if #names == 0 then
+            scopeLbl.Text = "Cakupan: SELURUH game (tap sistem di bawah untuk mempersempit)"
+            scopeLbl.TextColor3 = T.dim
+        else
+            scopeLbl.Text = "Cakupan: " .. table.concat(names, ", ")
+            scopeLbl.TextColor3 = T.accent
+        end
+    end
+
+    local function buildSystems()
+        if sysBox then sysBox:Destroy() end
+        sysBox = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, dp)
+        sysBox.LayoutOrder = 2
+        new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, sysBox)
+        local maxScore = 1
+        for _, s in ipairs(SCAN.systems) do maxScore = math.max(maxScore, s.score) end
+        if #SCAN.systems == 0 then
+            ordered(sysBox, label(sysBox, "Tidak ada sistem terdeteksi dari penamaan. Pakai kata kunci kustom di bawah.", { Size = UDim2.new(1, 0, 0, 34), TextColor3 = T.dim, TextSize = 12 }))
+        end
+        for _, s in ipairs(SCAN.systems) do
+            local b = ordered(sysBox, new("TextButton", { Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = T.panel, Text = "", AutoButtonColor = false, BorderSizePixel = 0 }, sysBox))
+            corner(b)
+            local stroke = new("UIStroke", { Color = T.accent, Thickness = 1.5, Transparency = SC.sel[s.id] and 0 or 1 }, b)
+            label(b, s.name, { Size = UDim2.new(0.62, 0, 0, 18), Position = UDim2.fromOffset(10, 4), Font = Enum.Font.GothamMedium, TextWrapped = false })
+            label(b, ("remote %d | script %d | value %d | lain %d | attr %d"):format(s.remote, s.script, s.value, s.other, s.attr),
+                { Size = UDim2.new(1, -20, 0, 14), Position = UDim2.fromOffset(10, 22), TextSize = 10, TextColor3 = T.dim, TextWrapped = false })
+            local bg = new("Frame", { Size = UDim2.new(0.3, 0, 0, 5), Position = UDim2.new(0.7, -10, 0, 9), BackgroundColor3 = T.off, BorderSizePixel = 0 }, b)
+            corner(bg, 3)
+            local fill = new("Frame", { Size = UDim2.new(math.clamp(s.score / maxScore, 0.06, 1), 0, 1, 0), BackgroundColor3 = T.blue, BorderSizePixel = 0 }, bg)
+            corner(fill, 3)
+            b.Activated:Connect(function()
+                SC.sel[s.id] = (not SC.sel[s.id]) and true or nil
+                SC.reset()
+                stroke.Transparency = SC.sel[s.id] and 0 or 1
+                refreshScope()
+            end)
+        end
+    end
+
+    local kwBox
+    local rowBtns = ordered(dp, new("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1 }, dp))
+    rowBtns.LayoutOrder = 1
+    new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 6) }, rowBtns)
+    button(rowBtns, "Pilih semua", function()
+        for _, s in ipairs(SCAN.systems) do SC.sel[s.id] = true end
+        SC.reset() buildSystems() refreshScope()
+    end, { Size = UDim2.new(0.5, -3, 1, 0), TextSize = 12 })
+    button(rowBtns, "Kosongkan", function()
+        SC.sel = {}
+        S.setCustom("")
+        if kwBox then kwBox.Text = "" end
+        SC.reset() buildSystems() refreshScope()
+    end, { Size = UDim2.new(0.5, -3, 1, 0), TextSize = 12 })
+    kwBox = new("TextBox", {
+        Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = T.panel, TextColor3 = T.text, PlaceholderText = "kata kunci tambahan (pisah koma): sword, orb, boss",
+        PlaceholderColor3 = T.dim, Text = "", Font = Enum.Font.Gotham, TextSize = 12, ClearTextOnFocus = false,
+        BorderSizePixel = 0, TextXAlignment = Enum.TextXAlignment.Left,
+    }, dp)
+    corner(kwBox)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 10) }, kwBox)
+    kwBox.LayoutOrder = 3
+    kwBox.FocusLost:Connect(function()
+        S.setCustom(kwBox.Text)
+        refreshScope()
+    end)
+    ORD[dp] = 3
+
+    section(dp, "MODUL DUMP")
+    local MODS = {
+        { "instances", "Instance tree + values + attributes", true },
+        { "tags", "CollectionService tags", true },
+        { "scripts", "Script + decompile", true },
+        { "modules_return", "Return ModuleScript (yang sudah load)", CAP.getloadedmodules ~= nil },
+        { "senv", "Script environment (getsenv)", CAP.getsenv ~= nil },
+        { "gc", "Garbage collector (fungsi + tabel)", CAP.getgc ~= nil },
+        { "remotes", "Remote + handler client", true },
+        { "saveinstance", "saveinstance() bawaan executor", CAP.saveinstance ~= nil },
+    }
+    for _, m in ipairs(MODS) do
+        toggle(dp, m[2], function() return CFG.Modules[m[1]] end, function(v) CFG.Modules[m[1]] = v end, m[3])
+    end
+    toggle(dp, "Decompile (off = constants/protos saja)", function() return CFG.DecompileScripts end, function(v) CFG.DecompileScripts = v end, CAP.decompile ~= nil)
+    toggle(dp, "Simpan bytecode mentah", function() return CFG.DumpBytecode end, function(v) CFG.DumpBytecode = v end, CAP.getscriptbytecode ~= nil)
+    toggle(dp, "Sertakan CoreGui / CorePackages", function() return CFG.DumpCore end, function(v) CFG.DumpCore = v end)
+
+    local dumpBtn
+    dumpBtn = ordered(dp, button(dp, CAN_WRITE and "MULAI DUMP" or "DUMP BUTUH writefile", function()
+        if D.running then
+            APP.cancel = true
+            setStatus("menghentikan...", nil, T.warn)
+            return
+        end
+        if not CAN_WRITE then return end
+        dumpBtn.Text, dumpBtn.BackgroundColor3 = "STOP DUMP", T.bad
+        task.spawn(function()
+            D.run()
+            if dumpBtn.Parent then dumpBtn.Text, dumpBtn.BackgroundColor3 = "MULAI DUMP", T.accent end
+        end)
+    end, { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = CAN_WRITE and T.accent or T.off, TextColor3 = T.bg, Font = Enum.Font.GothamBold }))
+
+    -------------------------------------------------- Live
+    local lv = new("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Visible = false }, content)
+    local ctl = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, lv)
+    new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, ctl)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 8) }, ctl)
+    toggle(ctl, "Remote spy (IN + OUT)", function() return CFG.Live.remotes end, function(v) CFG.Live.remotes = v end)
+    toggle(ctl, "Value + attribute watcher", function() return CFG.Live.values end, function(v) CFG.Live.values = v end)
+    toggle(ctl, "Instance spawn / hapus", function() return CFG.Live.instances end, function(v) CFG.Live.instances = v end)
+    local brow = ordered(ctl, new("Frame", { Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1 }, ctl))
+    new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, brow)
+    local paused = false
+    local liveBtn, pauseBtn
+    liveBtn = button(brow, "MULAI", function()
+        if L.on then
+            L.stop()
+            liveBtn.Text, liveBtn.BackgroundColor3 = "MULAI", T.accent
+        else
+            L.start()
+            if L.on then liveBtn.Text, liveBtn.BackgroundColor3 = "STOP", T.bad end
+        end
+    end, { Size = UDim2.new(0.25, -3, 1, 0), BackgroundColor3 = T.accent, TextColor3 = T.bg, TextSize = 12, Font = Enum.Font.GothamBold })
+    pauseBtn = button(brow, "Pause UI", function()
+        paused = not paused
+        pauseBtn.Text = paused and "Lanjut UI" or "Pause UI"
+    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    local feedFrame
+    button(brow, "Bersihkan", function()
+        for _, c in ipairs(feedFrame:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    button(brow, "Unmute", function()
+        L.muted = {}
+        setStatus("mute dibersihkan", nil, T.accent)
+    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    local statLbl = ordered(ctl, label(ctl, "live belum aktif | log: live/events.log + events.jsonl", { Size = UDim2.new(1, 0, 0, 16), TextSize = 11, TextColor3 = T.dim, Font = Enum.Font.Code, TextWrapped = false }))
+
+    feedFrame = new("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 1, -190), Position = UDim2.new(0, 8, 0, 182), BackgroundColor3 = T.panel, BorderSizePixel = 0,
+        ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, lv)
+    corner(feedFrame)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 1) }, feedFrame)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4), PaddingTop = UDim.new(0, 4) }, feedFrame)
+    ORD[feedFrame] = 0
+    pages.live = lv
+
+    local function pumpFeed()
+        local feed = L.feed
+        if #feed == 0 then return end
+        L.feed = {}
+        if paused then return end
+        for _, e in ipairs(feed) do
+            local row = ordered(feedFrame, new("TextButton", {
+                Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+                Text = e.line, TextColor3 = KIND_COLOR[e.kind] or T.text, Font = Enum.Font.Code, TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, AutoButtonColor = false, BorderSizePixel = 0,
+            }, feedFrame))
+            row.Activated:Connect(function()
+                if CAP.setclipboard then
+                    pcall(CAP.setclipboard, e.detail)
+                    setStatus("event disalin ke clipboard", nil, T.accent)
+                end
+            end)
+        end
+        local kids = {}
+        for _, c in ipairs(feedFrame:GetChildren()) do if c:IsA("TextButton") then kids[#kids + 1] = c end end
+        table.sort(kids, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+        for i = 1, #kids - CFG.UIMaxRows do kids[i]:Destroy() end
+        feedFrame.CanvasPosition = Vector2.new(0, 1e6)
+    end
+    task.spawn(function()
+        while not APP.dead do
+            task.wait(0.25)
+            pcall(pumpFeed)
+            if L.on or next(L.stats) then
+                statLbl.Text = ("OUT %d | IN %d | VAL %d | ATR %d | ADD %d | watch %d | drop %d | muted %d"):format(
+                    L.stats.OUT or 0, L.stats["IN "] or 0, L.stats.VAL or 0, L.stats.ATR or 0, L.stats.ADD or 0,
+                    L.watchN, L.dropped, (function() local n = 0 for _ in next, L.muted do n += 1 end return n end)())
+            end
+        end
+    end)
+
+    -------------------------------------------------- Logs
+    local lg = new("Frame", { Size = UDim2.new(1, 0, 1, 0), BackgroundTransparency = 1, Visible = false }, content)
+    local lrow = new("Frame", { Size = UDim2.new(1, -16, 0, 28), Position = UDim2.fromOffset(8, 8), BackgroundTransparency = 1 }, lg)
+    new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, lrow)
+    button(lrow, "Salin path", function()
+        if CAP.setclipboard and W.root then pcall(CAP.setclipboard, "workspace/" .. W.root) setStatus("path disalin", nil, T.accent) end
+    end, { Size = UDim2.new(0.34, -3, 1, 0), TextSize = 12 })
+    button(lrow, "Salin log", function()
+        local t = {}
+        for _, e in ipairs(LOG.lines) do t[#t + 1] = e.text end
+        if CAP.setclipboard then pcall(CAP.setclipboard, table.concat(t, "\n")) setStatus("log disalin", nil, T.accent) end
+    end, { Size = UDim2.new(0.33, -3, 1, 0), TextSize = 12 })
+    button(lrow, "Rescan", function() doRescan() end, { Size = UDim2.new(0.33, -3, 1, 0), TextSize = 12 })
+    local logFrame = new("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 1, -48), Position = UDim2.fromOffset(8, 42), BackgroundColor3 = T.panel, BorderSizePixel = 0,
+        ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, lg)
+    corner(logFrame)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, logFrame)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 6), PaddingTop = UDim.new(0, 4) }, logFrame)
+    ORD[logFrame] = 0
+    local function addLogRow(e)
+        ordered(logFrame, label(logFrame, e.text, {
+            Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code, TextSize = 11,
+            TextColor3 = e.level == "error" and T.bad or (e.level == "warn" and T.warn or T.text),
+        }))
+        logFrame.CanvasPosition = Vector2.new(0, 1e6)
+    end
+    for _, e in ipairs(LOG.lines) do addLogRow(e) end
+    LOG.onAdd = function(e)
+        addLogRow(e)
+        if e.level == "error" then setStatus(e.text, nil, T.bad) end
+    end
+    pages.logs = lg
+
+    -------------------------------------------------- overview content + rescan
+    local function fillOverview()
+        local I = SCAN.info
+        local lines = {
+            ("<b>%s</b>"):format(W.gname),
+            ("PlaceId %d  |  Executor %s"):format(game.PlaceId, tostring(I.executor)),
+            ("instance %d (tree %d, nil %d)"):format(I.total or 0, I.tree or 0, I.nil_ or 0),
+            ("remote %d | script %d | value %d | attr-holder %d"):format(I.remotes or 0, I.scripts or 0, I.values or 0, I.attrs or 0),
+            ("player %d | karakter %s | leaderstats %s"):format(I.players or 0, I.character and "ya" or "belum", I.leaderstats and "ada" or "tidak"),
+            ("sistem terdeteksi: %d  (scan %.2fs)"):format(#SCAN.systems, I.seconds or 0),
+        }
+        if I.streaming then
+            lines[#lines + 1] = '<font color="#F5B450">StreamingEnabled aktif: hanya instance yang ter-stream yang terlihat. Dekati area penting lalu Rescan.</font>'
+        end
+        if not CAN_WRITE then
+            lines[#lines + 1] = '<font color="#EB646E">Executor tanpa writefile: dump/log file tidak bisa disimpan.</font>'
+        end
+        infoLbl.Text = table.concat(lines, "\n")
+        fwLbl.Text = "<b>Framework:</b> " .. (#SCAN.frameworks > 0 and table.concat(SCAN.frameworks, ", ") or "tidak terdeteksi")
+        local parts = {}
+        for _, n in ipairs(CAPLIST) do
+            parts[#parts + 1] = ('<font color="%s">%s%s</font>'):format(CAP[n] and "#5ADC8C" or "#EB646E", CAP[n] and "+" or "-", n)
+        end
+        capLbl.Text = "<b>Kemampuan executor:</b> " .. table.concat(parts, "  ")
+    end
+
+    doRescan = function()
+        if SCAN.busy or D.running then return end
+        task.spawn(function()
+            local ok, err = pcall(S.run, function(f, t) setStatus(t, f) end)
+            if not ok then LOG.add("error", "scan: " .. tostring(err)) end
+            fillOverview()
+            buildSystems()
+            refreshScope()
+            setStatus("scan selesai", 1, T.accent)
+        end)
+    end
+    ordered(ov, button(ov, "RESCAN MAP", function() doRescan() end, { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = T.blue, TextColor3 = T.bg, Font = Enum.Font.GothamBold }))
+
+    addTab("ov", "Overview", ov)
+    addTab("dump", "Dump", dp)
+    addTab("live", "Live", lv)
+    addTab("logs", "Logs", lg)
+    pages.ov, pages.dump = ov, dp
+    fillOverview()
+    buildSystems()
+    refreshScope()
+    showPage("dump")
+    setStatus(("siap | %d sistem | RightControl = sembunyi"):format(#SCAN.systems), 0)
+
+    gui.Parent = (CAP.gethui and CAP.gethui()) or CoreGui
+end
+
+---------------------------------------------------------------------
+-- 7. boot
+---------------------------------------------------------------------
+function APP.Scan() return S.run() end
+function APP.Dump() return D.run() end
+function APP.LiveStart() return L.start() end
+function APP.LiveStop() return L.stop() end
+APP.CFG, APP.SCAN, APP.INDEX, APP.LIVE = CFG, SCAN, INDEX, L
+
+task.spawn(function()
+    UI.splash()
+    local ok, err = pcall(S.run, UI.splashSet)
+    if not ok then
+        LOG.add("error", "scan gagal: " .. tostring(err))
+        SCAN.busy, SCAN.done = false, true
+    end
+    if APP.dead then return end
+    local okU, errU = pcall(UI.build)
+    if not okU then
+        LOG.add("error", "ui gagal: " .. tostring(errU) .. " (API tetap bisa dipakai lewat getgenv().DumperPP)")
+        if splash.gui then pcall(function() splash.gui:Destroy() end) end
+    end
 end)

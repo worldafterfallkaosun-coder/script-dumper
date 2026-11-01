@@ -145,6 +145,24 @@
 	  BARU  : tab Log nyatet Kind hit yang belum dikenal (info) -> bahan buat nambah dukungan skill berikutnya.
 ]]
 
+--[[
+	v11.0 (= v10 + abis parry nggak bolong lagi + guard abis lu yang kena parry + pad ping/fps). Logika timing inti v10 NGGAK diubah.
+	  Dari dump CombatHandler: Block OFF = BlockReadyAt +0.75s (BlockCooldown). v10 selalu ngelepas block sedetik setelah Parried
+	  (ReleaseOnParry) -> selama 0.75s itu Block ON ditolak server. Hit lanjutan attacker yang ke-parry (stun 0.75s + windup 0.2s = ~0.95s)
+	  cuma nyisain jendela (0.2 - ping - frame - noise) buat Block ON -> di ping > ~65ms hampir selalu bolong, dan attacker LAIN / skill
+	  yang nyampe di 0.75s itu nggak bisa ditutup sama sekali. Block ngurangin damage 100% (DamageMultiplier = 0 di semua style), jadi
+	  ditahan jauh lebih aman daripada dilepas.
+	  PARRY  : PostParryHold. Abis Parried, block DITAHAN lewat jendela hit lanjutan attacker itu (+ tail, + pad ping/fps) dan minimal
+	           sampai ParryCooldown lewat. Dilepas lagi (gaya v10, buat re-parry) cuma kalau hitungan slack ping+fps lu masih longgar
+	           DAN nggak ada attacker lain yang aktif di deket lu.
+	  HOLD   : MaxHold 2.5s dulu motong block di tengah combo -> 0.75s bolong. Sekarang selama masih ada attacker aktif (ngayun
+	           dalam 1s terakhir, <= 20 stud) batasnya MaxHoldActive (6s). Hold nyambung/ResultPad ikut melebar kalau ping goyang.
+	  KENA PARRY (lu yang ke-parry musuh, stun 0.75s): unlock stun pakai kompensasi hasil belajar (stunComp), bukan rtt/2, dan Block
+	           dikirim otomatis pas stun lepas kalau musuhnya masih deket -> hit lanjutan dia di jendela parry (umur block 0..0.25s).
+	  PAD    : LagAdaptive. lagPad() = 0 di ping <= 80ms & 60fps; naik pelan sesuai ping / frame time / jitter. Dipakai di ChainHold,
+	           tail abis parry, hold guard.
+]]
+
 local genv = (getgenv and getgenv()) or _G
 if genv.__NyxAutoParry then
 	pcall(genv.__NyxAutoParry.Stop)
@@ -309,6 +327,19 @@ local CFG = {
 	BarrageDefaultInterval = 0.2,
 	BarrageWindow = 2.4, -- hit yang selisihnya < Interval * ini = masih barrage yang sama
 	BackHitGuard = true, -- kalau server nyalain BackHit & penyerang di belakang lu: dodge (block bakal dipecahin server)
+
+	-- ===== v11 =====
+	PostParryHold = true, -- abis NGE-PARRY: block ditahan (BlockCooldown 0.75s abis OFF = celah buat hit lanjutan / attacker lain)
+	ReparryPad = 0.04, -- pengaman (detik) di hitungan jendela re-parry
+	ReparryMinSlack = 0.05, -- slack minimal biar block dilepas lagi buat re-parry (ping+fps bagus); di bawah ini block ditahan
+	PostParryTail = 0.12, -- tahan block segini detik setelah perkiraan hit lanjutan (attacker telat ngayun dikit tetap ketutup)
+	MaxHoldActive = 6, -- batas tahan block nyambung kalau masih ada attacker aktif di deket lu (MaxHold = batas pas sepi)
+	HotWindow = 1.0, -- attacker dianggap aktif kalau ngayun dalam sekian detik terakhir
+	HotRadius = 20, -- stud
+	LagAdaptive = true, -- ChainHold / ResultPad / tail ikut melebar kalau ping tinggi, jitter gede, atau fps rendah
+	ParriedGuard = true, -- abis LU yang ke-parry musuh: Block ON pas stun lepas (nutup / parry hit lanjutan musuh)
+	ParriedGuardHold = 0.55, -- tahan block segini detik abis stun lepas (diperpanjang chain kalau ada hit)
+	ParriedGuardRange = 14, -- stud: musuh yang ngeparry lu harus sedeket ini
 }
 
 ----------------------------------------------------------------------
@@ -393,6 +424,7 @@ local combo = setmetatable({}, weak) -- [attacker] = { idx, at }
 local planToken = setmetatable({}, weak)
 local heavySeen = setmetatable({}, weak)
 local lastSwingSeen = setmetatable({}, weak) -- v6: [attacker] = os.clock() swing terakhir yang kebaca
+local SK = { barr = setmetatable({}, weak), seen = {} } -- v10/v11: satu tabel buat semua helper tambahan (hemat jatah local Luau)
 local m2Miss = setmetatable({}, weak) -- [attacker] = berapa kali parry M2 dia miss berturut-turut
 local comboVictim = setmetatable({}, weak) -- v8: [attacker] = { at = hit terakhir yang nyampe ke lu, n = jumlah hit/block beruntun }
 local rawOn = false -- v8: Block ON terakhir lewat remote langsung (cek lokal game nolak, model kita bilang aman)
@@ -885,6 +917,26 @@ local function holdAfter()
 	return math.clamp(CFG.HoldAfterHit + 2 * net.var + frame.p90, 0.05, 0.30)
 end
 
+-- v11: tambahan pad (detik) buat kondisi jelek. 0 di ping <= 80ms + 60fps + jitter kecil; naik pelan kalau ping tinggi,
+-- jitter gede, atau frame time jelek. Dipakai di ChainHold, tail abis parry, hold guard.
+function SK.lagPad()
+	if not CFG.LagAdaptive then
+		return 0
+	end
+	local p = math.clamp((net.rtt - 0.08) * 0.5, 0, 0.18)
+	local f = math.clamp((frame.avg - 1 / 60) * 3, 0, 0.10)
+	local j = math.clamp((net.var - 0.012) * 1.5, 0, 0.08)
+	return p + f + j
+end
+
+-- v11: ResultPad ikut melebar kalau jitter ping gede (event hasil hit nyampe telat -> block dulu keburu lepas sebelum hasilnya tau)
+function SK.resPad()
+	if not CFG.LagAdaptive then
+		return 0
+	end
+	return math.min(net.var * 2, 0.06)
+end
+
 -- v5: estimasi noise timing (detik): jitter ping + kuantisasi frame + ketidakpastian asimetri jalur
 local function sigmaNow()
 	local v = net.var * 1.25
@@ -1016,12 +1068,34 @@ local function pressBlock(hold)
 	return true
 end
 
+-- v11: ada attacker (bukan lu) yang ngayun dalam HotWindow terakhir dan masih di deket lu?
+function SK.hot(now)
+	local char, hrp = myState()
+	if not hrp then
+		return false
+	end
+	for a, t in pairs(lastSwingSeen) do
+		if now - t < CFG.HotWindow and typeof(a) == "Instance" and a ~= char and a.Parent then
+			local ah = a:FindFirstChild("HumanoidRootPart")
+			if ah and (ah.Position - hrp.Position).Magnitude <= CFG.HotRadius then
+				return true
+			end
+		end
+	end
+	return false
+end
+
 -- pastikan block yang lagi nyala masih nyala sampai `untilClock`
 local function extendHoldTo(untilClock)
 	if not blockHeld then
 		return false
 	end
-	local want = math.min(untilClock, blockOnAt + CFG.MaxHold)
+	local cap = CFG.MaxHold
+	-- v11: selama masih ada attacker aktif di deket lu, jangan lepas block di tengah combo (lepas = 0.75s nggak bisa block)
+	if CFG.PostParryHold and SK.hot(os.clock()) then
+		cap = math.max(cap, CFG.MaxHoldActive)
+	end
+	local want = math.min(untilClock, blockOnAt + cap)
 	if want > releaseAt then
 		scheduleRelease(want)
 	end
@@ -1720,8 +1794,9 @@ local function guardExtend(attacker, plan, tag, lead, now, rtt, fl, ha, note)
 	end
 	pending[#pending + 1] = { kind = plan.kind, hit = now + lead, done = false }
 	noteExpected(attacker, now + lead, now, plan.kind)
-	guardSwing(attacker, now, now + lead + CFG.ResultPad)
-	local coverTo = math.max(now + lead - rtt - fl + ha, now + lead + CFG.ResultPad)
+	local rp = CFG.ResultPad + SK.resPad()
+	guardSwing(attacker, now, now + lead + rp)
+	local coverTo = math.max(now + lead - rtt - fl + ha, now + lead + rp)
 	if extendHoldTo(coverTo) then
 		counters.chained += 1
 		if CFG.Trace then trace(("%s dari %s: block ditahan terus (%s), cover sampai +%.3fs"):format(tag, attacker.Name, note, coverTo - now)) end
@@ -1791,7 +1866,7 @@ local function scheduleBlock(attacker, plan, tag, lead, sendIn, age, ha, rtt, fl
 
 	local tok = (planToken[attacker] or 0) + 1
 	planToken[attacker] = tok
-	local resultAt = hitAt + CFG.ResultPad
+	local resultAt = hitAt + CFG.ResultPad + SK.resPad()
 	local hold = math.max(age, 0) + ha
 	-- v4: hold minimal sampai event hasil hit nyampe, biar Blocked bisa disambung chain guard
 	-- (kalau hasilnya Parried, block langsung dilepas lagi di onHit)
@@ -1876,7 +1951,6 @@ local function lateFallback(plan, tag, lead, rtt, fl, bound, wait)
 end
 
 -- v10: sama persis kayak CombatHandler.FromBehind (server): penyerang di belakang lu = block lu dipecahin + damage penuh
-local SK = { barr = setmetatable({}, weak), seen = {} } -- v10: satu tabel buat semua helper skill (hemat jatah local Luau)
 function SK.behind(attacker, hrp, angleDeg)
 	local ahrp = attacker:FindFirstChild("HumanoidRootPart")
 	if not ahrp then
@@ -2252,6 +2326,84 @@ function SK.reflex(attacker, now, res)
 	}, "SK")
 end
 
+-- v11: abis LU nge-parry attacker. Server ngasih attacker stun (ParryAttackerRecovery 0.75s). Kalau block dilepas sekarang,
+-- BlockReadyAt = +0.75s (BlockCooldown); hit lanjutan attacker itu mendarat (stun + windup) setelah sekarang, jadi jendela
+-- buat Block ON = stun + windup - BlockCooldown - ping - frame - noise. Return jam client sampai kapan block ditahan,
+-- atau nil = lepas sekarang (re-parry masih masuk akal di ping/fps lu dan nggak ada attacker lain yang aktif).
+function SK.postParry(attacker, data, now)
+	local rtt, fl, sg = net.rtt, frameLag(), sigmaNow()
+	local stun = (type(data.AttackerStun) == "number" and data.AttackerStun > 0) and data.AttackerStun or SR.ParryRecovery
+	local wind = CFG.DefaultM1Lead
+	if typeof(attacker) == "Instance" then
+		local style = styleOf(attacker)
+		local m1 = style and style.M1
+		local sw = type(m1) == "table" and type(m1.Swings) == "table" and m1.Swings[1] or nil
+		if type(sw) == "table" and type(sw.Windup) == "number" then
+			wind = sw.Windup * timeScale(attacker, style, sw)
+		end
+	end
+	local followAt = now + stun + wind -- paling cepat hit lanjutan attacker yang ke-parry mendarat (jam client)
+	local slack = (stun + wind) - SR.BlockCooldown - rtt - fl - 2 * sg - CFG.ReparryPad
+	local crowd = false
+	local _, hrp = myState()
+	if hrp then
+		for a, t in pairs(lastSwingSeen) do
+			if a ~= attacker and now - t < CFG.HotWindow * 1.5 and typeof(a) == "Instance" and a.Parent then
+				local ah = a:FindFirstChild("HumanoidRootPart")
+				if ah and (ah.Position - hrp.Position).Magnitude <= CFG.HotRadius then
+					crowd = true
+					break
+				end
+			end
+		end
+	end
+	if slack >= CFG.ReparryMinSlack and not crowd then
+		return nil
+	end
+	local lp = SK.lagPad()
+	return math.max(
+		followAt + CFG.ResultPad + SK.resPad() + holdAfter() + CFG.PostParryTail + lp,
+		now + SR.ParryCooldown + holdAfter() + lp
+	)
+end
+
+-- v11: LU yang ke-parry musuh (stun). Block ON dikirim pas stun lepas kalau musuhnya masih deket: hit lanjutan musuh biasanya
+-- mendarat 0.1-0.3s setelah stun lepas = masih di window parry (umur block 0..0.25s), kalau lebih telat tetap ke-block (0 damage).
+function SK.parriedGuard(enemy, now, unlockAt)
+	if not (alive and CFG.Enabled and CFG.ParriedGuard and typeof(enemy) == "Instance") then
+		return
+	end
+	local tok = (planToken[enemy] or 0) + 1
+	planToken[enemy] = tok
+	local tries = 0
+	local function attempt()
+		if not alive or not CFG.Enabled or planToken[enemy] ~= tok then
+			return
+		end
+		if blockHeld then
+			extendHoldTo(os.clock() + CFG.ParriedGuardHold)
+			return
+		end
+		if attackerGone(enemy) then
+			return
+		end
+		local _, hrp = myState()
+		local eh = enemy:FindFirstChild("HumanoidRootPart")
+		if not (hrp and eh) or (eh.Position - hrp.Position).Magnitude > CFG.ParriedGuardRange then
+			return
+		end
+		if pressBlock(CFG.ParriedGuardHold + holdAfter() + SK.lagPad()) then
+			pressMode = "plain" -- waktunya ditentuin stun lepas, bukan lead swing -> jangan ikut ngegeser tune parry
+			blockFor = nil
+			evt("info", "guard pas stun lepas")
+		elseif tries < 3 then
+			tries += 1
+			schedule(os.clock() + 0.03, attempt)
+		end
+	end
+	schedule(unlockAt + 0.012 + frame.avg * CFG.FireEarly, attempt)
+end
+
 -- v8: belajar seberapa awal block boleh dikirim pas stun lepas. accepted = block yang dikirim pas unlock diterima server.
 local function stunLearn(accepted)
 	if not CFG.FastUnlock or os.clock() - stunProbeAt > 1.0 then
@@ -2343,7 +2495,18 @@ local function onHit(data)
 
 	-- gue yang nyerang dan ke-parry -> gue yang stun
 	if attacker == myChar and data.Result == "Parried" then
-		lockedUntil = math.max(lockedUntil, now + (data.AttackerStun or SR.ParryRecovery) - net.rtt / 2)
+		local stunLen = (type(data.AttackerStun) == "number" and data.AttackerStun > 0) and data.AttackerStun or SR.ParryRecovery
+		-- v11: unlock stun pakai kompensasi hasil belajar (stunComp), bukan rtt/2 yang kekonservatif
+		local unlockAt = now + stunLen - (CFG.ParriedGuard and stunComp() or net.rtt / 2)
+		lockedUntil = math.max(lockedUntil, unlockAt)
+		if CFG.ParriedGuard then
+			stunSrcUntil = unlockAt -- block pas-unlock jadi bahan belajar stunSlack juga
+			stunUntil = math.max(stunUntil, now + stunLen - net.rtt / 2)
+			local okG, errG = pcall(SK.parriedGuard, data.Victim, now, unlockAt)
+			if not okG then
+				trace("parriedGuard error:", tostring(errG))
+			end
+		end
 		return
 	end
 	if victim ~= myChar then
@@ -2407,7 +2570,20 @@ local function onHit(data)
 		end
 		-- v4: abis parry, lepas block biar cooldown-nya (0.75s) cepet beres buat parry berikutnya,
 		-- kecuali ada hit lain yang lagi ditunggu dalam <0.9s
-		if CFG.ReleaseOnParry and blockHeld then
+		-- v11: block ditahan lewat jendela hit lanjutan (lihat SK.postParry); nil = lepas kayak v10
+		local ppHold = nil
+		if CFG.PostParryHold and blockHeld then
+			local okP, rP = pcall(SK.postParry, attacker, data, now)
+			if okP then
+				ppHold = rP
+			else
+				trace("postParry error:", tostring(rP))
+			end
+		end
+		if ppHold then
+			extendHoldTo(ppHold)
+			evt("info", ("block ditahan %.2fs abis parry"):format(math.max(ppHold - now, 0)))
+		elseif CFG.ReleaseOnParry and blockHeld then
 			local keep, lastAt = false, 0
 			for _, e in ipairs(expected) do
 				if e.kind ~= "DODGE" and e.atk ~= attacker and e.at > now + 0.12 and e.at < now + 0.9 then
@@ -2449,7 +2625,7 @@ local function onHit(data)
 			tuneBy(kind, 1)
 		end
 		if CFG.ChainGuard and kind == "M1" then
-			extendHoldTo(now + CFG.ChainHold)
+			extendHoldTo(now + CFG.ChainHold + SK.lagPad())
 		end
 		if CFG.Debug then log(("block  %s (tune M1 %+.3f M2 %+.3f%s)"):format(kind, tune.M1, tune.M2, inParryCd and ", parry cooldown" or "")) end
 	elseif res == "GuardBroken" then
@@ -3191,7 +3367,7 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v10 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v11 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -3475,7 +3651,7 @@ local function buildUI()
     local dot = make("Frame", { Position = UDim2.fromOffset(14, 17), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.good, BorderSizePixel = 0 }, titleBar)
     corner(dot, 4)
     text(titleBar, "Nyx AutoParry", 14, T.text, Enum.Font.GothamBold, { Position = UDim2.fromOffset(30, 0), Size = UDim2.new(0, 98, 1, 0) })
-    text(titleBar, "v10.0", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
+    text(titleBar, "v11.0", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
 
     local function iconBtn(sym, xFromRight, cb)
         local b = make("TextButton", {
@@ -3957,6 +4133,11 @@ local function buildUI()
         { "Barrage guard", "BarrageGuard", "skill multi-hit: block/parry lagi tiap Interval" },
         { "Back-hit guard", "BackHitGuard", "kalau server nyalain BackHit: dodge, bukan block" },
     })
+    group("Abis parry (v11)", {
+        { "Tahan block abis parry", "PostParryHold", "nggak dilepas langsung (cooldown 0.75s = celah)" },
+        { "Guard abis kena parry", "ParriedGuard", "block pas stun lepas kalau LU yang ke-parry" },
+        { "Pad ping / fps", "LagAdaptive", "hold & chain melebar kalau ping tinggi / fps rendah" },
+    })
 
     ------------------------------------------------------------------
     -- Halaman 3: Timing
@@ -4392,7 +4573,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "9.0",
+    Version = "11.0",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -4464,5 +4645,5 @@ if CFG.UI then
     end)
 end
 
-notify("v10.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v10.0. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v11.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v11.0. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")

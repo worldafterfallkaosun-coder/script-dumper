@@ -146,6 +146,11 @@
 ]]
 
 --[[
+	v11.1 = v11.0 + (1) Why() nandain hit yang masuk abis lu nge-parry / abis lu ke-parry, (2) kalau event Parried nyampe pas block
+	  udah keburu lepas (hold abis parry nggak sempat jalan), block dijadwalin ulang pas jendela hit lanjutan attacker (SK.postParryLate)
+	  dan di log keluar "parry masuk tapi block udah lepas Xms lalu".
+]]
+--[[
 	v11.0 (= v10 + abis parry nggak bolong lagi + guard abis lu yang kena parry + pad ping/fps). Logika timing inti v10 NGGAK diubah.
 	  Dari dump CombatHandler: Block OFF = BlockReadyAt +0.75s (BlockCooldown). v10 selalu ngelepas block sedetik setelah Parried
 	  (ReleaseOnParry) -> selama 0.75s itu Block ON ditolak server. Hit lanjutan attacker yang ke-parry (stun 0.75s + windup 0.2s = ~0.95s)
@@ -2367,6 +2372,55 @@ function SK.postParry(attacker, data, now)
 	)
 end
 
+-- v11.1: event Parried nyampe pas block udah keburu lepas (BlockReadyAt = lepas + 0.75s). Jadwalin Block ON se-awal mungkin
+-- yang masih diterima server tapi sebelum hit lanjutan attacker mendarat. Kalau hit lanjutan mendarat sebelum block siap -> skip.
+function SK.postParryLate(attacker, data, now)
+	if not (alive and CFG.Enabled) or typeof(attacker) ~= "Instance" then
+		return
+	end
+	local rtt, fl = net.rtt, frameLag()
+	local stun = (type(data.AttackerStun) == "number" and data.AttackerStun > 0) and data.AttackerStun or SR.ParryRecovery
+	local wind = CFG.DefaultM1Lead
+	local style = styleOf(attacker)
+	local m1 = style and style.M1
+	local sw = type(m1) == "table" and type(m1.Swings) == "table" and m1.Swings[1] or nil
+	if type(sw) == "table" and type(sw.Windup) == "number" then
+		wind = sw.Windup * timeScale(attacker, style, sw)
+	end
+	local followAt = now + stun + wind
+	local readyAt = lastOwnOff + SR.BlockCooldown + 0.02 + fl
+	local sendAt = math.max(readyAt, followAt - rtt - fl - 0.10)
+	if sendAt > followAt - rtt - fl then
+		evt("info", "hit lanjutan keburu mendarat sebelum block siap")
+		return
+	end
+	local tok = (planToken[attacker] or 0) + 1
+	planToken[attacker] = tok
+	schedule(sendAt, function()
+		if not alive or not CFG.Enabled or planToken[attacker] ~= tok then
+			return
+		end
+		if blockHeld then
+			extendHoldTo(followAt + CFG.PostParryTail + holdAfter())
+			return
+		end
+		if attackerGone(attacker) then
+			return
+		end
+		local _, hrp = myState()
+		local ah = attacker:FindFirstChild("HumanoidRootPart")
+		if not (hrp and ah) or (ah.Position - hrp.Position).Magnitude > CFG.ComboKeepRange + 6 then
+			return
+		end
+		local hold = math.max(followAt - os.clock(), 0) + CFG.PostParryTail + holdAfter() + SK.lagPad()
+		if pressBlock(hold) then
+			pressMode = "plain"
+			blockFor = nil
+			evt("info", "block cadangan abis parry")
+		end
+	end)
+end
+
 -- v11: LU yang ke-parry musuh (stun). Block ON dikirim pas stun lepas kalau musuhnya masih deket: hit lanjutan musuh biasanya
 -- mendarat 0.1-0.3s setelah stun lepas = masih di window parry (umur block 0..0.25s), kalau lebih telat tetap ke-block (0 damage).
 function SK.parriedGuard(enemy, now, unlockAt)
@@ -2499,6 +2553,7 @@ local function onHit(data)
 		-- v11: unlock stun pakai kompensasi hasil belajar (stunComp), bukan rtt/2 yang kekonservatif
 		local unlockAt = now + stunLen - (CFG.ParriedGuard and stunComp() or net.rtt / 2)
 		lockedUntil = math.max(lockedUntil, unlockAt)
+		SK.bpAt = now
 		if CFG.ParriedGuard then
 			stunSrcUntil = unlockAt -- block pas-unlock jadi bahan belajar stunSlack juga
 			stunUntil = math.max(stunUntil, now + stunLen - net.rtt / 2)
@@ -2613,6 +2668,13 @@ local function onHit(data)
 				extendHoldTo(lastAt + CFG.ResultPad + holdAfter())
 			end
 		end
+		if CFG.PostParryHold and not blockHeld and not ppHold then
+			evt("info", ("parry masuk tapi block udah lepas %.0fms lalu"):format(math.max(now - lastOwnOff, 0) * 1000))
+			local okL, errL = pcall(SK.postParryLate, attacker, data, now)
+			if not okL then
+				trace("postParryLate error:", tostring(errL))
+			end
+		end
 		if CFG.Debug then log(("PARRY  (%d parry / %d block / %d gb / %d hit)"):format(counters.parried, counters.blocked, counters.guardbroken, counters.hit)) end
 	elseif res == "Blocked" then
 		counters.blocked += 1
@@ -2663,6 +2725,7 @@ local function onHit(data)
 				t = now, kind = kind, who = nameOf(attacker), why = reason, rtt = net.rtt, fps = frame.fps,
 				held = blockHeld, locked = lockBefore, stun = type(data.Stun) == "number" and data.Stun or 0,
 				sent = sent and true or false, slack = stunSlack, combo = cvw and cvw.n or 1,
+				pa = now - parriedAt, bp = now - (SK.bpAt or -math.huge),
 			}
 			if #whyLog > 20 then
 				table.remove(whyLog, 1)
@@ -3026,9 +3089,11 @@ local function whyReport()
 	for i = math.max(1, #whyLog - 9), #whyLog do
 		local w = whyLog[i]
 		print(
-			("[AutoParry:why] %.1fs lalu | %s dari %s (combo ke-%d) | alasan: %s | rtt %.0fms fps %.0f | block %s | kunci %.2fs | stun %.2fs | sent %s | slack %.2f"):format(
+			("[AutoParry:why] %.1fs lalu | %s dari %s (combo ke-%d) | alasan: %s | rtt %.0fms fps %.0f | block %s | kunci %.2fs | stun %.2fs | sent %s | slack %.2f%s"):format(
 				clk - w.t, w.kind, w.who, w.combo, tostring(w.why), w.rtt * 1000, w.fps,
-				w.held and "nyala" or "mati", w.locked, w.stun, tostring(w.sent), w.slack
+				w.held and "nyala" or "mati", w.locked, w.stun, tostring(w.sent), w.slack,
+				(w.pa and w.pa < 2.0) and (" | %.2fs abis LU parry"):format(w.pa)
+					or ((w.bp and w.bp < 2.0) and (" | %.2fs abis LU ke-parry"):format(w.bp) or "")
 			)
 		)
 	end
@@ -3367,7 +3432,7 @@ local function summaryText()
     local rate = all > 0 and (c.parried + c.blocked + c.dodged) / all * 100 or 100
     local parryRate = landed > 0 and c.parried / landed * 100 or 0
     return table.concat({
-        ("AutoParry v11 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
+        ("AutoParry v11.1 | parry %d  block %d  dodge %d  kena %d  gb %d | aman %.0f%% | parry-rate %.0f%%"):format(
             c.parried, c.blocked, c.dodged, c.hit, c.guardbroken, rate, parryRate
         ),
         ("rtt %.0fms (±%.0f) | fps %.0f (p90 %.0fms, spike %d) | cpu %.0fus/frame (max %.0fus)"):format(
@@ -3651,7 +3716,7 @@ local function buildUI()
     local dot = make("Frame", { Position = UDim2.fromOffset(14, 17), Size = UDim2.fromOffset(8, 8), BackgroundColor3 = T.good, BorderSizePixel = 0 }, titleBar)
     corner(dot, 4)
     text(titleBar, "Nyx AutoParry", 14, T.text, Enum.Font.GothamBold, { Position = UDim2.fromOffset(30, 0), Size = UDim2.new(0, 98, 1, 0) })
-    text(titleBar, "v11.0", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
+    text(titleBar, "v11.1", 10, T.sub, Enum.Font.GothamMedium, { Position = UDim2.fromOffset(130, 0), Size = UDim2.new(0, 40, 1, 0) })
 
     local function iconBtn(sym, xFromRight, cb)
         local b = make("TextButton", {
@@ -4573,7 +4638,7 @@ end
 -- API + START
 ----------------------------------------------------------------------
 genv.__NyxAutoParry = {
-    Version = "11.0",
+    Version = "11.1",
     CFG = CFG,
     Counters = counters,
     Skips = skips,
@@ -4645,5 +4710,5 @@ if CFG.UI then
     end)
 end
 
-notify("v11.0 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
-log("loaded v11.0. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")
+notify("v11.1 loaded - tekan " .. CFG.ToggleKey.Name .. " buat toggle")
+log("loaded v11.1. toggle:", CFG.ToggleKey.Name, "| UI:", CFG.UIKey.Name, "| getgenv().__NyxAutoParry.Summary() buat ringkasan")

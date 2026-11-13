@@ -3690,7 +3690,9 @@ function UI.build()
 
     feedFrame = new("ScrollingFrame", {
         Size = UDim2.new(1, -16, 1, -250), Position = UDim2.new(0, 8, 0, 210), BackgroundColor3 = T.panel, BorderSizePixel = 0,
-        ScrollBarThickness = 3, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollBarThickness = 6, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingEnabled = true, ScrollingDirection = Enum.ScrollingDirection.Y, Active = true,
+        ElasticBehavior = Enum.ElasticBehavior.Never,
     }, lv)
     corner(feedFrame)
     new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 1) }, feedFrame)
@@ -3765,6 +3767,9 @@ function UI.build()
         if #feed == 0 then return end
         L.feed = {}
         if paused then return end
+        -- auto-scroll cuma kalau kamu memang lagi di dasar feed; kalau udah scroll ke atas, posisi dibiarin
+        local function gap() return feedFrame.AbsoluteCanvasSize.Y - feedFrame.AbsoluteWindowSize.Y - feedFrame.CanvasPosition.Y end
+        local stick = gap() <= 40
         for i = math.max(1, #feed - CFG.LiveFeedPerTick + 1), #feed do
             local e = feed[i]
             local row = ordered(feedFrame, new("TextButton", {
@@ -3777,8 +3782,17 @@ function UI.build()
         local kids = {}
         for _, c in ipairs(feedFrame:GetChildren()) do if c:IsA("TextButton") then kids[#kids + 1] = c end end
         table.sort(kids, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
-        for i = 1, #kids - CFG.UIMaxRows do kids[i]:Destroy() end
-        feedFrame.CanvasPosition = Vector2.new(0, 1e6)
+        local removed = 0
+        for i = 1, #kids - CFG.UIMaxRows do
+            removed = removed + kids[i].AbsoluteSize.Y + 1
+            kids[i]:Destroy()
+        end
+        if stick then
+            feedFrame.CanvasPosition = Vector2.new(0, 1e6)
+        elseif removed > 0 then   -- baris lama di atas dibuang: geser biar yang lagi dibaca ga loncat
+            local p = feedFrame.CanvasPosition
+            feedFrame.CanvasPosition = Vector2.new(0, math.max(0, p.Y - removed))
+        end
     end
     task.spawn(function()
         while not APP.dead do

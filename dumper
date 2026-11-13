@@ -1,54 +1,56 @@
 --[[
-    DUMPER++ v5 "Zenith"  |  Roblox universal dumper + live monitor + analyzer (Luau / executor)
+    DUMPER++ v6 "Overdrive"  |  Roblox universal dumper + live monitor + analyzer (Luau / executor)
 
     Alur    : load -> SCAN sistem di map -> UI dibangun dari hasil scan -> pilih sistem & modul -> Dump / Live / Cari
     Butuh   : executor dengan writefile / appendfile / makefolder untuk simpan file.
               Tanpa itu scan + UI + live + cari tetap jalan, hanya tidak bisa menyimpan.
-              Fungsi lain (getgc, decompile, hookmetamethod, listfiles, dst) opsional:
+              Fungsi lain (getgc, decompile, hookmetamethod, hookfunction, listfiles, dst) opsional:
               fitur yang tidak didukung otomatis redup / dilewati.
     Output  : workspace/DumpPP/<PlaceId>_<Game>/<tanggal_jam>/
                 dump : summary.md, manifest.json, _info.txt, _session.log, instances.txt, values.txt, attributes.txt,
                        tags.txt, scripts/, xref.txt, gui.txt, prompts.txt, player.txt, modules_return.txt, senv.txt,
                        gc_functions.txt, gc_tables.txt, remotes.txt, diff_vs_prev.txt,
-                       remote_callsites.txt, strings.txt, urls_assets.txt, script_profile.txt, require_graph.mmd
+                       remote_callsites.txt, strings.txt, urls_assets.txt, script_profile.txt, require_graph.mmd,
+                       v6: remotes_api.lua, assets_instances.txt, gameinfo.txt, refs_used.txt,
+                           modules_return_unloaded.txt (opsional)
                 cache: workspace/DumpPP/cache/<hash>.lua (decompile, dipakai ulang)
-                live : live/events_<jam>.log + .jsonl + remote_stats_<jam>.txt + remote_catalog_<jam>.md (log ditulis terus-menerus)
+                live : live/events_<jam>.log + .jsonl + remote_stats_<jam>.txt + remote_catalog_<jam>.md
+                       (log ditulis terus-menerus; stats + katalog di-autosave tiap 15 dtk dan saat teleport)
     Setting : workspace/DumpPP/settings.json (tersimpan otomatis dari toggle UI)
     Hotkey  : RightControl = sembunyi / tampilkan UI
-    API     : getgenv().DumperPP = { Scan(), Dump(), Diff(), Search(mode: inst|remote|src|gc, q), LiveStart(), LiveStop(), Stop(), Destroy() }
+    API     : getgenv().DumperPP = { Scan(), Dump(), Diff(), Search(mode: inst|remote|src|gc, q), LiveStart(), LiveStop(),
+                                     LiveSave(), Stop(), Destroy() }
     Config  : getgenv().DumperPP_Config = { DecompileWorkers = 8 }   -- diisi SEBELUM execute
     Re-run  : execute ulang otomatis membersihkan instance lama.
 
+    BARU di v6 (dibanding v5 Zenith)
+      * Live lebih andal : hook GANDA (namecall + hookfunction langsung, anti-dobel), tiap panggilan punya #id dan
+                           InvokeServer menampilkan latensi, hook dibungkus pcall (tidak bisa merusak game),
+                           throttle per detik (bukan mute permanen; NOTE tiap 10 dtk), antrean 20rb, loop per-frame,
+                           autosave remote_stats + katalog tiap 15 dtk & saat teleport (tidak hilang kalau game ditutup),
+                           watcher Humanoid (Health / WalkSpeed / JumpPower ...), attribute pada instance baru,
+                           hook OnClientInvoke (opsional), tombol Abaikan / Fokus / Simpan
+      * Dump lebih lengkap : alias remote statis (local X = ...:WaitForChild("Nama") -> callsite terselesaikan ke nama
+                           remote), remotes_api.lua (tabel Remotes siap pakai), assets_instances.txt (anim / sound /
+                           gambar / mesh), gameinfo.txt (setting service, Teams, GetProductInfo), refs_used.txt
+                           (attribute + tag yang dipakai script), require modul data yang belum load (opsional),
+                           retry decompile yang timeout
+
     BARU di v5 (dibanding v4 Apex)
       * Cache decompile : hasil decompile disimpan per script-hash di DumpPP/cache (dipakai ulang lintas sesi DAN game).
-                          Dump ke-2 dst. jauh lebih cepat. Worker decompile default 8, gagal tidak diulang-ulang
       * Cari "Source"   : grep isi SEMUA script (decompile paralel + cache) -> path:baris, tap = salin
-                          API: DumperPP.Search("src", "kata")
       * Callsite statis : remote_callsites.txt = semua X:FireServer(...) / InvokeServer + handler OnClientEvent /
-                          OnClientInvoke dikelompokkan per remote (melengkapi live spy, tanpa perlu memicu remote)
-      * Harvest statis  : strings.txt, urls_assets.txt, script_profile.txt (peringkat script menarik),
-                          require_graph.mmd (graf dependensi Mermaid)
-      * Live spy        : profil argumen per remote (tipe, rentang angka, nilai enum-like), puncak panggilan/detik,
-                          filter path (include / -exclude), remote_catalog.md ditulis saat Live berhenti
-      * Index nama      : pencarian Instance memakai indeks yang dibangun sekali per scan (jauh lebih cepat)
-
-    BARU di v4 (dibanding v3 Atlas)
-      * Remote spy v2   : script pemanggil (getcallingscript), nilai return InvokeServer (opsional), statistik &
-                          signature argumen per remote (live/remote_stats), salin sebagai kode Lua, replay, block remote
-      * XRef            : peta remote -> script yang menyebut namanya + daftar require() per script (xref.txt)
-      * Diff            : bandingkan dump sekarang vs dump sebelumnya (instance / remote / script hash) -> diff_vs_prev.txt
-      * Dump baru       : gui.txt (tombol + jumlah koneksi), prompts.txt (ProximityPrompt / ClickDetector), player.txt
-      * summary.md      : ringkasan satu halaman (sistem, remote paling banyak dirujuk, script terbesar, error)
-      * Tab Cari        : cari instance / remote / konstanta di seluruh GC (tap hasil = salin)
-      * Fix             : log live tidak lagi menimpa sesi sebelumnya, nama game ditunggu sebelum folder dibuat,
-                          hook namecall v4 terpisah dari v3 (re-run tidak bentrok)
+                          OnClientInvoke dikelompokkan per remote
+      * Harvest statis  : strings.txt, urls_assets.txt, script_profile.txt, require_graph.mmd
+      * Live spy        : profil argumen per remote, puncak panggilan/detik, filter path (include / -exclude)
+      * Index nama      : pencarian Instance memakai indeks yang dibangun sekali per scan
 
     Catatan : kode SERVER (ServerScriptService, ServerStorage, Script server) tidak pernah dikirim
               ke client, jadi tidak bisa di-dump dari sisi client. Map dengan StreamingEnabled hanya
               menampilkan instance yang sedang ter-stream (scan akan memberi peringatan).
 ]]
 
-local VERSION = "5.0"
+local VERSION = "6.0"
 local ENV = (getgenv and getgenv()) or getfenv()
 
 if type(ENV.DumperPP) == "table" and type(ENV.DumperPP.Destroy) == "function" then
@@ -60,7 +62,7 @@ ENV.DumperPP = APP
 local function onCleanup(f) APP.cleanups[#APP.cleanups + 1] = f end
 function APP.Destroy()
     APP.dead, APP.cancel = true, true
-    ENV.DumperPP_Hook4, ENV.DumperPP_Ret4 = nil, nil
+    ENV.DumperPP_Hook6, ENV.DumperPP_Ret6 = nil, nil
     for i = #APP.cleanups, 1, -1 do pcall(APP.cleanups[i]) end
     if ENV.DumperPP == APP then ENV.DumperPP = nil end
 end
@@ -73,7 +75,7 @@ local CAPLIST = {
     "writefile", "appendfile", "makefolder", "readfile", "isfile", "isfolder", "listfiles", "decompile", "getinstances",
     "getnilinstances", "getscripts", "getloadedmodules", "getscriptclosure", "getscripthash",
     "getscriptbytecode", "getgc", "getconnections", "getcallbackvalue", "getsenv", "getrawmetatable",
-    "islclosure", "isexecutorclosure", "hookmetamethod", "getnamecallmethod", "setnamecallmethod",
+    "islclosure", "isexecutorclosure", "hookmetamethod", "hookfunction", "getnamecallmethod", "setnamecallmethod",
     "getcallingscript", "firesignal", "checkcaller", "newcclosure", "saveinstance", "setclipboard", "gethui",
     "identifyexecutor",
 }
@@ -100,8 +102,10 @@ local CFG = {
         senv = true, gc = true, remotes = true, saveinstance = false,
         gui = true, prompts = true, player = true,
         callsites = true, strings = true,   -- v5: analisis statis (butuh fase scripts)
+        assets = true, gameinfo = true,     -- v6
+        require_unloaded = false,           -- v6: require ModuleScript yang belum load (hanya yang tampak "data murni")
     },
-    Live = { remotes = true, values = true, instances = false, returns = false },
+    Live = { remotes = true, values = true, instances = false, returns = false, props = true, invokes = false, hookfn = true },
 
     DecompileScripts = true,   -- decompile semua script (fallback: constants/protos)
     DumpBytecode     = false,  -- bytecode mentah tiap script
@@ -109,10 +113,11 @@ local CFG = {
     XRef             = true,   -- peta remote <-> script + require (xref.txt)
     AutoDiff         = true,   -- bandingkan otomatis dengan dump sebelumnya (butuh listfiles + readfile)
 
-    SettingsRev      = 5,      -- naik tiap ada default baru (settings.json lama tidak menimpa DecompileWorkers)
+    SettingsRev      = 6,      -- naik tiap ada default baru (settings.json lama tidak menimpa default yang berubah)
     DecompileWorkers = 8,
     DecompileCache   = true,   -- cache decompile per hash di DumpPP/cache (butuh getscripthash + isfile/readfile)
-    ScriptTimeout    = 10,
+    ScriptTimeout    = 15,
+    ScriptRetry      = true,   -- v6: kalau decompile timeout, coba sekali lagi dengan timeout 2x
     RequireTimeout   = 3,
     FrameBudget      = 0.012,
     MaxFileBytes     = 4 * 1024 * 1024,
@@ -128,17 +133,20 @@ local CFG = {
     },
 
     -- live
-    LiveMaxWatch        = 1500,  -- maks value/attribute yang diawasi
-    LiveSpamPerSec      = 40,    -- >N event/detik dari satu sumber = auto-mute
+    LiveMaxWatch        = 5000,  -- maks value/attribute yang diawasi
+    LiveSpamPerSec      = 60,    -- >N event/detik dari satu sumber = sisanya dibuang (throttle, NOTE tiap 10 dtk)
     LiveFlushSec        = 1,     -- interval flush log ke file
     LiveJSONL           = true,  -- tulis events.jsonl (satu JSON per baris)
     LiveArgDepth        = 3,
-    LiveQueueMax        = 6000,
+    LiveQueueMax        = 20000,
     LiveIncludeExecutor = false, -- ikutkan remote yang dipanggil oleh executor sendiri
     LiveCallers         = true,  -- catat script pemanggil tiap remote OUT (butuh getcallingscript)
     LiveRemoteStats     = true,  -- statistik + signature argumen per remote
     LiveStatsMaxRemotes = 3000,
     LiveProfile         = true,  -- profil argumen per remote (tipe / rentang / nilai enum-like)
+    LiveAutosaveSec     = 15,    -- v6: simpan remote_stats + katalog tiap N detik (0 = hanya saat stop)
+    LiveBudget          = 0.006, -- v6: detik kerja per frame untuk memproses antrean
+    LiveFeedPerTick     = 60,    -- v6: maks baris baru di UI per 0.25 dtk (log file tetap lengkap)
     LiveFilter          = { include = {}, exclude = {} }, -- substring path (huruf kecil); kosong = semua
 
     SearchMax = 150,
@@ -164,7 +172,12 @@ do
             if CAP.isfile(SETTINGS_FILE) then return HttpService:JSONDecode(CAP.readfile(SETTINGS_FILE)) end
         end)
         if ok and type(data) == "table" then
-            if data.SettingsRev ~= CFG.SettingsRev then data.DecompileWorkers = nil end
+            if data.SettingsRev ~= CFG.SettingsRev then
+                -- default yang berubah di versi baru tidak boleh tertimpa settings lama
+                for _, k in ipairs({ "DecompileWorkers", "ScriptTimeout", "LiveSpamPerSec", "LiveQueueMax", "LiveMaxWatch" }) do
+                    data[k] = nil
+                end
+            end
             merge(CFG, data)
         end
     end
@@ -597,6 +610,7 @@ task.spawn(function()
     end, 5)
     if ok and type(info) == "table" and info.Name then
         W.gname = (tostring(info.Name):gsub("[^%w_%-]", "_")):sub(1, 40)
+        W.pinfo = info -- v6: dipakai gameinfo.txt
     end
     W.gready = true
 end)
@@ -662,6 +676,10 @@ function SRC.get(s)
 
     SRC.miss += 1
     local ok, r = U.withTimeout(CAP.decompile, CFG.ScriptTimeout, s)
+    if not ok and r == "timeout" and CFG.ScriptRetry then
+        -- v6: script besar sering timeout di percobaan pertama
+        ok, r = U.withTimeout(CAP.decompile, CFG.ScriptTimeout * 2, s)
+    end
     if ok and type(r) == "string" and #r > 0 then
         local b = { body = r }
         SRC.mem[s] = b
@@ -983,7 +1001,7 @@ function S.run(progress)
 end
 
 ---------------------------------------------------------------------
--- 4. DUMP ENGINE (fase-fase v3 + gui/prompts/player + xref + summary + diff)
+-- 4. DUMP ENGINE (fase-fase v3 + gui/prompts/player + xref + summary + diff + v6 assets/gameinfo/remotes_api)
 ---------------------------------------------------------------------
 local D = { running = false }
 function D.status(text, frac, quiet)
@@ -1224,11 +1242,12 @@ function D.run()
         tree = 0, nil_ = 0, values = 0, attrs = 0, tags = 0, scripts = 0, dups = 0,
         modules = 0, senv = 0, remotes = 0, gcFuncs = 0, gcTables = 0, gui = 0, prompts = 0, player = 0, xrefRemotes = 0,
         callsites = 0, strings = 0, cacheHits = 0, cacheDisk = 0, cacheMiss = 0,
+        assets = 0, gameinfo = 0, reqData = 0, remoteApi = 0, refsUsed = 0,
     }
     local XR = { names = {}, refs = {}, reqs = {}, sizes = {} }
     local AN = {
         sites = {}, nsites = 0, handlers = {}, strs = {}, nstr = 0, urls = {}, nurls = 0,
-        assets = {}, nassets = 0, prof = {},
+        assets = {}, nassets = 0, prof = {}, attrUse = {}, nattr = 0, tagUse = {}, ntag = 0,
     }
     local selNames = {}
     for id in next, SC.sel do selNames[#selNames + 1] = id end
@@ -1237,11 +1256,13 @@ function D.run()
     LOG.add("info", scoped and ("scope: " .. table.concat(selNames, ", ")) or "scope: seluruh game")
 
     local phasesOn = {
-        M.instances, M.tags, M.scripts, M.modules_return and CAP.getloadedmodules, M.senv and CAP.getsenv,
-        M.gc and CAP.getgc, M.remotes, M.gui, M.prompts, M.player, M.saveinstance and CAP.saveinstance,
+        M.instances, M.tags, M.scripts, M.modules_return and CAP.getloadedmodules,
+        M.require_unloaded and CAP.decompile and CFG.DecompileScripts, M.senv and CAP.getsenv,
+        M.gc and CAP.getgc, M.remotes, M.gui, M.prompts, M.player, M.assets, M.gameinfo,
+        M.saveinstance and CAP.saveinstance,
     }
     local total, phaseNo, curBase = 0, 0, 0
-    for i = 1, 11 do if phasesOn[i] then total += 1 end end
+    for i = 1, 14 do if phasesOn[i] then total += 1 end end
     total = math.max(total, 1)
 
     local function sub(frac, text) D.status(text, curBase + frac / total, true) end
@@ -1405,7 +1426,7 @@ function D.run()
                 end
             end
 
-            -- ===== v5: analisis statis per script (callsite remote, string, url, asset, profil) =====
+            -- ===== analisis statis per script (callsite remote, string, url, asset, profil, attribute, tag) =====
             local SENDM = { "FireServer", "InvokeServer" }
             local function cnt(body, pat)
                 local n = 0
@@ -1426,13 +1447,39 @@ function D.run()
                     AN[nKey] += 1
                 end
             end
+            -- v6: nama remote dari RHS "local X = ....WaitForChild("Nama")" / ".Nama" / ["Nama"]
+            local function aliasOf(rhs)
+                return rhs:match('WaitForChild%(%s*"([^"]+)"[^%)]*%)%s*$')
+                    or rhs:match('FindFirstChild%(%s*"([^"]+)"[^%)]*%)%s*$')
+                    or rhs:match('%["([^"]+)"%]%s*$')
+                    or rhs:match("%.([%a_][%w_]*)%s*$")
+            end
+            -- return: nama, terselesaikan (literal / alias)?
+            local function resolve(ref, alias)
+                local lit = ref:match("[\"']([^\"']+)[\"']%)*%]*$")
+                if lit then return lit, true end
+                local last = ref:match("([%a_][%w_]*)$")
+                if not last then return ref, false end
+                local a = alias[last]
+                if a then return a, true end
+                return last, false
+            end
             local function ana(m, body)
                 if not (M.callsites or M.strings) then return end
                 local nlines = 0
+                local alias, siteStart, hStart = {}, AN.nsites + 1, #AN.handlers + 1
                 SRC.eachLine(body, function(line, ln)
                     nlines = ln
                     if #line > 600 then return end
                     if M.callsites then
+                        local av, rhs = line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*(.+)$")
+                        if av then
+                            local nm = aliasOf(rhs)
+                            if nm then
+                                local cur = alias[av]
+                                if cur == nil then alias[av] = nm elseif cur ~= nm then alias[av] = false end
+                            end
+                        end
                         for _, meth in ipairs(SENDM) do
                             local a, b = line:find(":" .. meth .. "(", 1, true)
                             if a and AN.nsites < 30000 then
@@ -1466,11 +1513,28 @@ function D.run()
                         end
                     end
                 end)
+                if M.callsites then
+                    -- v6: selesaikan variabel lokal -> nama remote asli
+                    for i = siteStart, AN.nsites do
+                        local st = AN.sites[i]
+                        st.rname, st.res = resolve(st.ref, alias)
+                    end
+                    for i = hStart, #AN.handlers do
+                        local h = AN.handlers[i]
+                        h.rname, h.res = resolve(h.ref, alias)
+                    end
+                end
                 if M.strings then
                     for id in body:gmatch("rbxassetid://(%d+)") do bump(AN.assets, id, "nassets", 40000) end
                     for u in body:gmatch("https?://[%w%-%._~:/%?#@!%$&%*%+,;=%%]+") do
                         if #u < 200 then bump(AN.urls, u, "nurls", 5000) end
                     end
+                    for k in body:gmatch(':GetAttribute%(%s*"([^"\\]+)"') do bump(AN.attrUse, k, "nattr", 6000) end
+                    for k in body:gmatch(':SetAttribute%(%s*"([^"\\]+)"') do bump(AN.attrUse, k, "nattr", 6000) end
+                    for k in body:gmatch(':GetAttributeChangedSignal%(%s*"([^"\\]+)"') do bump(AN.attrUse, k, "nattr", 6000) end
+                    for k in body:gmatch('GetTagged%(%s*"([^"\\]+)"') do bump(AN.tagUse, k, "ntag", 3000) end
+                    for k in body:gmatch(':HasTag%(%s*"([^"\\]+)"') do bump(AN.tagUse, k, "ntag", 3000) end
+                    for k in body:gmatch(':AddTag%(%s*"([^"\\]+)"') do bump(AN.tagUse, k, "ntag", 3000) end
                 end
                 local pr = {
                     fire = cnt(body, ":FireServer%("), invoke = cnt(body, ":InvokeServer%("), onclient = cnt(body, "OnClientEvent"),
@@ -1616,7 +1680,7 @@ function D.run()
                 wx.close()
             end
 
-            -- ===== v5: tulis hasil analisis statis =====
+            -- ===== tulis hasil analisis statis =====
             if not APP.cancel then
                 counts.callsites, counts.strings = AN.nsites, AN.nstr
                 counts.cacheHits, counts.cacheDisk, counts.cacheMiss = SRC.hits, SRC.disk, SRC.miss
@@ -1624,10 +1688,10 @@ function D.run()
                 if M.callsites and (AN.nsites > 0 or #AN.handlers > 0) then
                     pcall(function()
                         local groups, order = {}, {}
-                        local function grp(ref)
-                            local nm = remoteName(ref)
+                        local function grp(ref, rname, res)
+                            local nm = rname or remoteName(ref)
                             local known = XR.names[nm]
-                            local key = known and nm or ref
+                            local key = (known or res) and nm or ref
                             local g = groups[key]
                             if not g then
                                 g = { key = key, known = known, out = {}, inn = {} }
@@ -1637,11 +1701,11 @@ function D.run()
                             return g
                         end
                         for _, st in ipairs(AN.sites) do
-                            local g = grp(st.ref)
+                            local g = grp(st.ref, st.rname, st.res)
                             g.out[#g.out + 1] = st
                         end
                         for _, h in ipairs(AN.handlers) do
-                            local g = grp(h.ref)
+                            local g = grp(h.ref, h.rname, h.res)
                             g.inn[#g.inn + 1] = h
                         end
                         table.sort(order, function(a, b)
@@ -1651,7 +1715,8 @@ function D.run()
                         end)
                         local w = W.new("remote_callsites")
                         w.add("# CALLSITE remote dari decompile script client (statis; melengkapi live spy)")
-                        w.add("# nomor baris = baris pada hasil decompile. key yang bukan nama remote = variabel/ekspresi.")
+                        w.add("# nomor baris = baris pada hasil decompile. v6: variabel lokal yang jelas menunjuk ke remote")
+                        w.add("# (local X = ...:WaitForChild(\"Nama\")) sudah diselesaikan ke nama remote-nya.")
                         w.add("")
                         for _, g in ipairs(order) do
                             w.add(("## %s  OUT=%d IN=%d%s"):format(g.key, #g.out, #g.inn,
@@ -1707,6 +1772,24 @@ function D.run()
                         wu.add("# rbxassetid di script client (" .. #as .. ")")
                         for _, r in ipairs(as) do wu.add(("%5d  rbxassetid://%s"):format(r[2], r[1])) end
                         wu.close()
+
+                        -- v6: attribute + tag yang dipakai script
+                        local wr = W.new("refs_used")
+                        local function dumpMap(title, map)
+                            local rows2 = {}
+                            for k, n in next, map do rows2[#rows2 + 1] = { k, n } end
+                            table.sort(rows2, function(a, b)
+                                if a[2] ~= b[2] then return a[2] > b[2] end
+                                return a[1] < b[1]
+                            end)
+                            wr.add("# " .. title .. " (" .. #rows2 .. ")")
+                            for _, r in ipairs(rows2) do wr.add(("%5d  %s"):format(r[2], U.clean(r[1]))) end
+                            wr.add("")
+                        end
+                        dumpMap("ATTRIBUTE yang dibaca / ditulis script client (GetAttribute / SetAttribute / AttributeChangedSignal)", AN.attrUse)
+                        dumpMap("TAG CollectionService yang dipakai script client (GetTagged / HasTag / AddTag)", AN.tagUse)
+                        wr.close()
+                        counts.refsUsed = AN.nattr + AN.ntag
                     end)
 
                     pcall(function()
@@ -1794,6 +1877,39 @@ function D.run()
             end)
         end)
 
+        -- 4b. v6: require ModuleScript yang BELUM ke-load, hanya yang tampak "data murni" (tanpa Connect / remote / loop)
+        phase("reqdata", M.require_unloaded and CAP.decompile and CFG.DecompileScripts, function()
+            local w = W.new("modules_return_unloaded")
+            local RISK = {
+                ":Connect(", "FireServer", "InvokeServer", "while ", "RunService", "LocalPlayer", "UserInputService",
+                "loadstring", "task.spawn", "task.delay", "spawn(", "Instance.new", ":Kick(", "TeleportService",
+                "HttpService", "OnClientEvent", "OnServerEvent",
+            }
+            local skipped = 0
+            U.each(scriptList, function(s)
+                if not s:IsA("ModuleScript") or loadedMods[s] then return end
+                if U.isCore(s) and not CFG.DumpCore then return end
+                if not SC.inst(s) then return end
+                local body = SRC.get(s)
+                if not body or #body > 400000 then
+                    skipped += 1
+                    return
+                end
+                for _, k in ipairs(RISK) do
+                    if body:find(k, 1, true) then
+                        skipped += 1
+                        return
+                    end
+                end
+                local okr, ret = U.withTimeout(require, CFG.RequireTimeout, s)
+                w.add("=== " .. U.path(s))
+                w.add(okr and U.ser(ret, CFG.MaxDepth, {}, "") or ("<require gagal: " .. tostring(ret) .. ">"))
+                w.add("")
+                counts.reqData += 1
+            end)
+            w.add(("# dilewati (bukan data murni / tanpa source / terlalu besar): %d"):format(skipped))
+        end)
+
         -- 5. environment script yang sedang jalan
         phase("senv", M.senv and CAP.getsenv, function()
             local w = W.new("senv")
@@ -1821,7 +1937,7 @@ function D.run()
             local ignore = {}
             for _, t in ipairs({ CFG, CFG.GCKeywords, keywords, INDEX, INDEX.all, INDEX.remotes, INDEX.scripts, INDEX.values,
                 INDEX.attrs, INDEX.prompts, INDEX.buttons, SCAN, W, W.files, W.all, LOG, LOG.lines, KW, NAME_MEMO, scriptList,
-                scriptSet, loadedMods, loadedList, counts, errors, timings, XR, ENV, _G, shared, RENV, gc, APP, CAP }) do
+                scriptSet, loadedMods, loadedList, counts, errors, timings, XR, AN, ENV, _G, shared, RENV, gc, APP, CAP }) do
                 if type(t) == "table" then ignore[t] = true end
             end
 
@@ -1911,7 +2027,7 @@ function D.run()
             end
         end)
 
-        -- 7. remote + handler client-nya
+        -- 7. remote + handler client-nya (+ v6: remotes_api.lua)
         phase("remotes", M.remotes, function()
             local w = W.new("remotes")
             U.each(INDEX.remotes, function(r)
@@ -1946,6 +2062,65 @@ function D.run()
                         w.add("    OnClientInvoke: " .. U.fnDesc(cb) .. U.constSummary(cb) .. U.upvalSummary(cb))
                     end
                 end
+            end)
+
+            -- v6: remotes_api.lua = tabel Remotes siap pakai + petunjuk callsite statis
+            pcall(function()
+                local sc = {}
+                for _, st in ipairs(AN.sites) do
+                    if st.rname then
+                        local e = sc[st.rname]
+                        if not e then
+                            e = { out = 0, inn = 0 }
+                            sc[st.rname] = e
+                        end
+                        e.out += 1
+                        if not e.ex then e.ex = ("%s%s <- %s:%d"):format(st.meth, st.args:sub(1, 80), st.p, st.ln) end
+                    end
+                end
+                for _, h in ipairs(AN.handlers) do
+                    if h.rname then
+                        local e = sc[h.rname]
+                        if not e then
+                            e = { out = 0, inn = 0 }
+                            sc[h.rname] = e
+                        end
+                        e.inn += 1
+                    end
+                end
+                local list = {}
+                for _, r in ipairs(INDEX.remotes) do
+                    local c = r.ClassName
+                    if (c == "RemoteEvent" or c == "RemoteFunction" or c == "UnreliableRemoteEvent") and SC.inst(r)
+                        and not (APP.gui and r:IsDescendantOf(APP.gui)) and (CFG.DumpCore or not U.isCore(r)) then
+                        list[#list + 1] = { r = r, p = U.path(r) }
+                    end
+                end
+                table.sort(list, function(a, b) return a.p < b.p end)
+                local wa = W.new("remotes_api", "lua")
+                wa.add(("-- Dumper++ v%s | %s (PlaceId %d) | %d remote"):format(VERSION, W.gname, game.PlaceId, #list))
+                wa.add("-- OUT/IN = jumlah callsite statis di script client; contoh = argumen yang terlihat di decompile")
+                wa.add("local Remotes = {}")
+                local used = {}
+                for _, it in ipairs(list) do
+                    U.pace()
+                    local r = it.r
+                    local nm = r.Name
+                    local key, k = nm, 1
+                    while used[key] do
+                        k += 1
+                        key = nm .. "#" .. k
+                    end
+                    used[key] = true
+                    local e = sc[nm]
+                    wa.add(("-- [%s] %s%s"):format(r.ClassName, it.p, e and (" | OUT=" .. e.out .. " IN=" .. e.inn) or ""))
+                    if e and e.ex then wa.add("-- contoh: " .. U.clean(e.ex)) end
+                    local okc, code = pcall(U.luaInst, r)
+                    wa.add(("Remotes[%q] = %s"):format(key, okc and code or "nil"))
+                    counts.remoteApi += 1
+                end
+                wa.add("return Remotes")
+                wa.close()
             end)
         end)
 
@@ -2061,6 +2236,95 @@ function D.run()
             counts.player = 1
         end)
 
+        -- 10b. v6: aset yang dirujuk properti instance (animasi, suara, gambar, mesh)
+        phase("assets", M.assets, function()
+            local P = {
+                Animation = { "AnimationId" }, Sound = { "SoundId" }, Decal = { "Texture" }, Texture = { "Texture" },
+                ImageLabel = { "Image" }, ImageButton = { "Image" }, MeshPart = { "MeshId", "TextureID" },
+                SpecialMesh = { "MeshId", "TextureId" }, ParticleEmitter = { "Texture" }, Beam = { "Texture" },
+                Trail = { "Texture" }, Shirt = { "ShirtTemplate" }, Pants = { "PantsTemplate" },
+                ShirtGraphic = { "Graphic" },
+                Sky = { "SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxRt", "SkyboxUp" },
+                VideoFrame = { "Video" },
+            }
+            local w = W.new("assets_instances")
+            w.add("# kelas | path | properti = nilai")
+            local list = INDEX.all
+            local n, seen = 0, {}
+            for i = 1, #list do
+                U.pace()
+                local inst = list[i]
+                pcall(function()
+                    local props = P[inst.ClassName]
+                    if not props then return end
+                    if APP.gui and inst:IsDescendantOf(APP.gui) then return end
+                    if not SC.inst(inst) then return end
+                    if not CFG.DumpCore and U.isCore(inst) then return end
+                    for _, prop in ipairs(props) do
+                        local okv, v = pcall(function() return inst[prop] end)
+                        if okv and type(v) == "string" and v ~= "" then
+                            seen[v] = (seen[v] or 0) + 1
+                            n += 1
+                            if n <= 60000 then
+                                w.add(("%-14s | %s | %s = %s"):format(inst.ClassName, U.path(inst), prop, U.clean(v)))
+                            end
+                        end
+                    end
+                end)
+                if i % 4000 == 0 then sub(i / #list, ("aset %d/%d"):format(i, #list)) end
+            end
+            local uniq = 0
+            for _ in next, seen do uniq += 1 end
+            w.add(("# total referensi: %d | aset unik: %d"):format(n, uniq))
+            counts.assets = n
+        end)
+
+        -- 10c. v6: info game, pengaturan service, Teams
+        phase("gameinfo", M.gameinfo, function()
+            local w = W.new("gameinfo")
+            local function props(title, inst, list)
+                if not inst then return end
+                w.add("## " .. title)
+                for _, p in ipairs(list) do
+                    local okv, v = pcall(function() return inst[p] end)
+                    if okv then w.add(("  %s = %s"):format(p, U.ser(v, 1, {}, "  "))) end
+                end
+                w.add("")
+            end
+            props("game", game, { "PlaceId", "GameId", "JobId", "PlaceVersion", "CreatorId", "CreatorType", "PrivateServerId", "PrivateServerOwnerId", "Name" })
+            if W.pinfo then
+                w.add("## MarketplaceService:GetProductInfo(PlaceId)")
+                w.add(U.ser(W.pinfo, 3, {}, ""))
+                w.add("")
+            end
+            props("Workspace", workspace, { "Gravity", "FallenPartsDestroyHeight", "StreamingEnabled", "StreamingMinRadius", "StreamingTargetRadius", "AllowThirdPartySales" })
+            local cam = workspace.CurrentCamera
+            props("Workspace.CurrentCamera", cam, { "FieldOfView", "CameraType", "CameraSubject" })
+            props("Players", Players, { "CharacterAutoLoads", "RespawnTime", "MaxPlayers", "PreferredPlayers", "LocalPlayer" })
+            props("StarterPlayer", svc("StarterPlayer"), {
+                "CameraMaxZoomDistance", "CameraMinZoomDistance", "CharacterWalkSpeed", "CharacterJumpPower", "CharacterJumpHeight",
+                "CharacterUseJumpPower", "CharacterMaxSlopeAngle", "HealthDisplayDistance", "NameDisplayDistance",
+                "AutoJumpEnabled", "LoadCharacterAppearance", "EnableMouseLockOption", "DevComputerMovementMode",
+            })
+            props("Lighting", svc("Lighting"), { "Technology", "ClockTime", "Brightness", "GlobalShadows" })
+            props("TextChatService", svc("TextChatService"), { "ChatVersion", "CreateDefaultTextChannels" })
+            local teams = svc("Teams")
+            if teams then
+                w.add("## Teams")
+                for _, t in ipairs(teams:GetChildren()) do
+                    if t:IsA("Team") then
+                        w.add(("  %s | TeamColor=%s AutoAssignable=%s"):format(t.Name, tostring(t.TeamColor), tostring(t.AutoAssignable)))
+                    end
+                end
+                w.add("")
+            end
+            w.add("## service (child langsung game)")
+            for _, c in ipairs(game:GetChildren()) do
+                w.add(("  %-28s %s"):format(c.ClassName, c.Name))
+            end
+            counts.gameinfo = 1
+        end)
+
         -- 11. saveinstance bawaan executor
         phase("saveinstance", M.saveinstance and CAP.saveinstance, function()
             CAP.saveinstance({ FileName = "DumpPP_" .. W.gname, NilInstances = true, DecompileScripts = true })
@@ -2163,8 +2427,9 @@ function D.run()
             w.add("")
         end
         if AN.nsites > 0 or #AN.prof > 0 then
-            w.add("## Analisis statis (v5)")
+            w.add("## Analisis statis")
             w.add(("- callsite remote: %d | handler client: %d | string unik: %d"):format(AN.nsites, #AN.handlers, AN.nstr))
+            w.add(("- attribute dipakai script: %d | tag dipakai script: %d"):format(AN.nattr, AN.ntag))
             w.add(("- cache decompile: %d memori | %d disk | %d decompile baru"):format(counts.cacheHits, counts.cacheDisk, counts.cacheMiss))
             for i = 1, math.min(#AN.prof, 10) do
                 w.add(("- script menarik [%d]: %s"):format(AN.prof[i][2].score, AN.prof[i][1]))
@@ -2192,7 +2457,7 @@ function D.run()
 end
 
 ---------------------------------------------------------------------
--- 5. LIVE MONITOR v2 (remote IN/OUT + caller + return, value, attribute, instance) + log file realtime
+-- 5. LIVE MONITOR v6 (remote IN/OUT + caller + return + latensi, value, attribute, humanoid, instance) + log file realtime
 ---------------------------------------------------------------------
 local L = {
     on = false, q = {}, qh = 0, qt = 0, dropped = 0, conns = {}, feed = {}, stats = {},
@@ -2200,6 +2465,11 @@ local L = {
     hooked = setmetatable({}, { __mode = "k" }), last = setmetatable({}, { __mode = "k" }),
     pathMemo = setmetatable({}, { __mode = "k" }), watchN = 0, epoch = os.time() - os.clock(),
     blocked = setmetatable({}, { __mode = "k" }), rstat = {}, rstatN = 0,
+    -- v6
+    thr = {}, dropTotal = 0, seq = 0, dd = {}, tag = "000000", run = 0,
+    pend = setmetatable({}, { __mode = "k" }),      -- thread -> {id, t} untuk memasangkan RET dengan OUT
+    invhooked = setmetatable({}, { __mode = "k" }), -- RemoteFunction yang callback-nya sudah di-hook
+    pw = setmetatable({}, { __mode = "k" }),        -- Humanoid yang sedang diawasi
 }
 
 L.fm = {}
@@ -2210,39 +2480,74 @@ local LIVE_CLASS = {
 }
 for c, k in next, KIND do if k == "remote" or k == "value" then LIVE_CLASS[c] = true end end
 
--- hook namecall v4: dipasang sekali per sesi executor, lalu membaca ENV.DumperPP_Hook4 / DumperPP_Ret4
--- (nama beda dari v3, jadi re-run dari versi lama tidak membuat event dobel)
+-- hook v6: (1) __namecall untuk remote:FireServer(...)  (2) hookfunction langsung untuk remote.FireServer(remote, ...)
+-- Dipasang sekali per sesi executor; isinya dibaca dari ENV.DumperPP_Hook6 / DumperPP_Ret6 (nil = pass-through).
+-- Panggilan yang tertangkap dua jalur sekaligus dibuang di L.hook (anti-dobel).
+-- Semua panggilan ke L.hook dibungkus pcall: error di spy tidak boleh sampai merusak game.
 local function ensureHook()
-    if ENV.DumperPP_HookInstalled4 then return true end
-    if not (CAP.hookmetamethod and CAP.getnamecallmethod) then return false end
+    if ENV.DumperPP_HookInstalled6 then return true end
     local wrap = CAP.newcclosure or function(f) return f end
     local getm, setm = CAP.getnamecallmethod, CAP.setnamecallmethod
-    local old
-    local ok = pcall(function()
-        old = CAP.hookmetamethod(game, "__namecall", wrap(function(self, ...)
-            local d = ENV.DumperPP_Hook4
-            if d then
-                local m = getm()
-                if SEND[m] then
-                    local block, capture = d(self, m, ...)
-                    if setm then setm(m) end
-                    if block then return end
-                    if capture then
-                        local r = table.pack(old(self, ...))
-                        local ret = ENV.DumperPP_Ret4
-                        if ret then ret(self, m, r) end
-                        return table.unpack(r, 1, r.n)
+    local okAny = false
+
+    if CAP.hookmetamethod and getm then
+        local old
+        local ok = pcall(function()
+            old = CAP.hookmetamethod(game, "__namecall", wrap(function(self, ...)
+                local d = ENV.DumperPP_Hook6
+                if d then
+                    local m = getm()
+                    if SEND[m] then
+                        local okd, block, capture = pcall(d, "nc", self, m, ...)
+                        if not okd then block, capture = nil, nil end
+                        if setm then setm(m) end
+                        if block then return end
+                        if capture then
+                            local r = table.pack(old(self, ...))
+                            local ret = ENV.DumperPP_Ret6
+                            if ret then pcall(ret, self, m, r) end
+                            return table.unpack(r, 1, r.n)
+                        end
                     end
                 end
-            end
-            return old(self, ...)
-        end))
-    end)
-    if ok and old then
-        ENV.DumperPP_HookInstalled4 = true
-        return true
+                return old(self, ...)
+            end))
+        end)
+        if ok and old then okAny = true end
     end
-    return false
+
+    if CAP.hookfunction then
+        local function hookFn(className, method)
+            pcall(function()
+                local inst = Instance.new(className)
+                local fn = inst[method]
+                inst:Destroy()
+                local orig
+                orig = CAP.hookfunction(fn, wrap(function(self, ...)
+                    local d = ENV.DumperPP_Hook6
+                    if d and typeof(self) == "Instance" then
+                        local okd, block, capture = pcall(d, "fn", self, method, ...)
+                        if not okd then block, capture = nil, nil end
+                        if block then return end
+                        if capture then
+                            local r = table.pack(orig(self, ...))
+                            local ret = ENV.DumperPP_Ret6
+                            if ret then pcall(ret, self, method, r) end
+                            return table.unpack(r, 1, r.n)
+                        end
+                    end
+                    return orig(self, ...)
+                end))
+                if orig then okAny = true end
+            end)
+        end
+        hookFn("RemoteEvent", "FireServer")
+        hookFn("RemoteFunction", "InvokeServer")
+        hookFn("UnreliableRemoteEvent", "FireServer")
+    end
+
+    if okAny then ENV.DumperPP_HookInstalled6 = true end
+    return okAny
 end
 
 local function qpush(item)
@@ -2255,23 +2560,95 @@ local function qpush(item)
 end
 
 -- dipanggil dari dalam hook: kerja minimal, serialisasi dilakukan di loop.
--- return: block?, capture return?
-function L.hook(self, m, ...)
+-- via: "nc" (namecall) / "fn" (hookfunction langsung). return: block?, capture return?
+function L.hook(via, self, m, ...)
     if typeof(self) ~= "Instance" then return false end
+    if via == "fn" and CFG.Live.hookfn == false then return false end
     if not CFG.LiveIncludeExecutor and CAP.checkcaller and CAP.checkcaller() then return false end
+    local now = os.clock()
+    local n = select("#", ...)
+    local a1 = ...
+    local dd = L.dd
+    if dd.via ~= via and dd.self == self and dd.m == m and dd.n == n and dd.a1 == a1 and now - (dd.t or 0) < 0.005 then
+        dd.via = via
+        return false -- jalur kedua untuk panggilan yang sama (namecall + hookfunction): abaikan
+    end
+    dd.via, dd.self, dd.m, dd.n, dd.a1, dd.t = via, self, m, n, a1, now
+
     local blocked = L.blocked[self] == true
     local caller
     if CFG.LiveCallers and CAP.getcallingscript then
         local ok, c = pcall(CAP.getcallingscript)
         if ok and typeof(c) == "Instance" then caller = c end
     end
-    qpush({ "OUT", m, self, table.pack(...), os.clock(), caller = caller, blocked = blocked })
+    L.seq += 1
+    local id = L.seq
+    qpush({ "OUT", m, self, table.pack(...), now, caller = caller, blocked = blocked, id = id })
     local isInvoke = (m == "InvokeServer" or m == "invokeServer")
-    return blocked, (not blocked) and isInvoke and CFG.Live.returns == true
+    local cap = (not blocked) and isInvoke and CFG.Live.returns == true
+    if cap then L.pend[coroutine.running()] = { id = id, t = now } end
+    return blocked, cap
 end
 
 function L.ret(self, m, r)
-    qpush({ "RET", m, self, r, os.clock() })
+    local th = coroutine.running()
+    local pd = L.pend[th]
+    L.pend[th] = nil
+    local now = os.clock()
+    qpush({ "RET", m, self, r, now, id = pd and pd.id, dt = pd and (now - pd.t) or nil })
+end
+
+-- v6 (opsional): server -> client RemoteFunction. Callback OnClientInvoke di-hook lewat hookfunction.
+function L.hookInvoke(r)
+    if L.invhooked[r] or not (CAP.hookfunction and CAP.getcallbackvalue) then return end
+    if r.ClassName ~= "RemoteFunction" then return end
+    local okc, cb = pcall(CAP.getcallbackvalue, r, "OnClientInvoke")
+    if not okc or type(cb) ~= "function" then return end
+    L.invhooked[r] = true
+    local orig
+    local okh = pcall(function()
+        orig = CAP.hookfunction(cb, (CAP.newcclosure or function(f) return f end)(function(...)
+            if L.on and CFG.Live.invokes then
+                qpush({ "IN ", "OnClientInvoke", r, table.pack(...), os.clock() })
+            end
+            return orig(...)
+        end))
+    end)
+    if not okh then L.invhooked[r] = nil end
+end
+
+-- v6: properti Humanoid pemain lokal (Health / WalkSpeed / JumpPower ...)
+local HPROPS = { "Health", "MaxHealth", "WalkSpeed", "JumpPower", "JumpHeight", "HipHeight", "Sit" }
+function L.watchHumanoid(h)
+    if not h or L.pw[h] then return end
+    L.pw[h] = true
+    for _, prop in ipairs(HPROPS) do
+        local okv, last = pcall(function() return h[prop] end)
+        if okv then
+            local c = h:GetPropertyChangedSignal(prop):Connect(function()
+                local okn, new = pcall(function() return h[prop] end)
+                if okn and new ~= last then
+                    local old = last
+                    last = new
+                    qpush({ "PRP", prop, h, { old, new, n = 2 }, os.clock() })
+                end
+            end)
+            L.conns[#L.conns + 1] = c
+        end
+    end
+end
+
+function L.watchPlayer()
+    local lp = Players and Players.LocalPlayer
+    if not lp then return end
+    local function onChar(ch)
+        task.spawn(function()
+            local h = ch:FindFirstChildOfClass("Humanoid") or ch:WaitForChild("Humanoid", 10)
+            if h and L.on then L.watchHumanoid(h) end
+        end)
+    end
+    if lp.Character then onChar(lp.Character) end
+    L.conns[#L.conns + 1] = lp.CharacterAdded:Connect(onChar)
 end
 
 function L.hookIn(r)
@@ -2301,10 +2678,12 @@ function L.watchValue(v)
     L.conns[#L.conns + 1] = c
 end
 
-function L.watchAttr(inst)
+-- needAttrs: true = hanya awasi kalau instance sudah punya attribute (dipakai untuk instance yang baru muncul)
+function L.watchAttr(inst, needAttrs)
     if L.watched[inst] or L.watchN >= CFG.LiveMaxWatch or not SC.inst(inst) then return end
     local ok, snap = pcall(inst.GetAttributes, inst)
     if not ok or type(snap) ~= "table" then return end
+    if needAttrs and next(snap) == nil then return end
     L.watched[inst], L.last[inst] = true, snap
     L.watchN += 1
     local c = inst.AttributeChanged:Connect(function(name)
@@ -2323,7 +2702,9 @@ function L.onAdded(d)
     local o = CFG.Live
     local kind = KIND[cls]
     if o.remotes and kind == "remote" then L.hookIn(d) end
+    if o.invokes and kind == "remote" then L.hookInvoke(d) end
     if o.values and kind == "value" then L.watchValue(d) end
+    if o.values and ATTR_KINDS[kind] then L.watchAttr(d, true) end
     if o.instances then qpush({ "ADD", cls, d, { cls, n = 1 }, os.clock() }) end
 end
 function L.onRemoving(d)
@@ -2433,7 +2814,7 @@ function L.process(it)
     local p = memoPath(inst)
     if not passFilter(p) then return end
 
-    -- caller + statistik per remote (dihitung sebelum mute supaya angka tetap akurat)
+    -- caller + statistik per remote (dihitung sebelum throttle supaya angka tetap akurat)
     local cp, rs
     if it.caller then cp = memoPath(it.caller) end
     if CFG.LiveRemoteStats and (kind == "OUT" or kind == "IN ") then
@@ -2450,7 +2831,7 @@ function L.process(it)
             if rs.sec ~= sec then rs.sec, rs.cur = sec, 0 end
             rs.cur += 1
             if rs.cur > (rs.peak or 0) then rs.peak = rs.cur end
-            if CFG.LiveProfile and (kind == "OUT" or kind == "IN ") then
+            if CFG.LiveProfile then
                 local nn = rs.out + rs.inn
                 if nn <= 500 or nn % 20 == 0 then
                     rs.pf = rs.pf or {}
@@ -2478,13 +2859,23 @@ function L.process(it)
         end
     end
 
-    local key = kind .. p .. (kind == "ATR" and name or "")
+    -- v6: throttle per detik (bukan mute permanen); NOTE tiap 10 dtk per sumber
+    local key = kind .. p .. ((kind == "ATR" or kind == "PRP") and name or "")
     if L.muted[key] then return end
     local c = (L.win[key] or 0) + 1
     L.win[key] = c
     if c > CFG.LiveSpamPerSec then
-        L.muted[key] = true
-        L.emit("NOTE", ("auto-mute (>%d/detik): %s"):format(CFG.LiveSpamPerSec, p), nil, nil, t)
+        local th = L.thr[key]
+        if not th then
+            th = { drop = 0, at = -100 }
+            L.thr[key] = th
+        end
+        th.drop += 1
+        L.dropTotal += 1
+        if t - th.at >= 10 then
+            th.at = t
+            L.emit("NOTE", ("throttle (>%d/detik) %s [%s] | dibuang dari log: %d"):format(CFG.LiveSpamPerSec, p, kind, th.drop), nil, nil, t)
+        end
         return
     end
 
@@ -2498,48 +2889,28 @@ function L.process(it)
         local ctext = cp and ("  <- " .. cp) or ""
         local detail = p .. "\n" .. table.concat(parts, "\n")
         if cp then detail = detail .. "\ncaller: " .. cp end
-        L.emit(kind, ("%s%-12s %s  %s%s"):format(tag, name, p, oneLine(table.concat(parts, ", "), 140), ctext),
-            detail, { dir = kind, method = name, path = p, args = parts, caller = cp, blocked = it.blocked or false }, t,
+        L.emit(kind, ("%s%s%-12s %s  %s%s"):format(it.id and ("#" .. it.id .. " ") or "", tag, name, p,
+            oneLine(table.concat(parts, ", "), 140), ctext),
+            detail, { dir = kind, id = it.id, method = name, path = p, args = parts, caller = cp, blocked = it.blocked or false }, t,
             { raw = args, inst = inst, method = name })
     elseif kind == "RET" then
-        L.emit("RET", ("%-12s %s -> %s"):format(name, p, oneLine(table.concat(parts, ", "), 140)),
-            p .. "\n" .. table.concat(parts, "\n"), { method = name, path = p, ret = parts }, t)
+        local dtxt = it.dt and ("  (%.0fms)"):format(it.dt * 1000) or ""
+        L.emit("RET", ("%s%-12s %s -> %s%s"):format(it.id and ("#" .. it.id .. " ") or "", name, p,
+            oneLine(table.concat(parts, ", "), 140), dtxt),
+            p .. "\n" .. table.concat(parts, "\n"),
+            { id = it.id, ms = it.dt and math.floor(it.dt * 1000) or nil, method = name, path = p, ret = parts }, t)
     elseif kind == "VAL" then
         L.emit(kind, ("%s: %s -> %s"):format(p, oneLine(parts[1], 60), oneLine(parts[2], 60)), nil,
             { path = p, old = parts[1], new = parts[2] }, t)
+    elseif kind == "PRP" then
+        L.emit(kind, ("%s .%s: %s -> %s"):format(p, name, oneLine(parts[1], 60), oneLine(parts[2], 60)), nil,
+            { path = p, prop = name, old = parts[1], new = parts[2] }, t)
     elseif kind == "ATR" then
         L.emit(kind, ("%s @%s: %s -> %s"):format(p, name, oneLine(parts[1], 60), oneLine(parts[2], 60)), nil,
             { path = p, attr = name, old = parts[1], new = parts[2] }, t)
     else
         L.emit(kind, ("%s (%s)"):format(p, name), nil, { path = p, class = name }, t)
     end
-end
-
--- tulis statistik remote (sekali, saat live berhenti)
-function L.writeStats()
-    if not CAN_WRITE or next(L.rstat) == nil then return end
-    local w = W.new("remote_stats_" .. os.date("%H%M%S"), "txt", "live")
-    local rows = {}
-    for p, s in next, L.rstat do rows[#rows + 1] = { p, s } end
-    table.sort(rows, function(a, b)
-        local ta, tb = a[2].out + a[2].inn, b[2].out + b[2].inn
-        if ta ~= tb then return ta > tb end
-        return a[1] < b[1]
-    end)
-    w.add("# statistik remote selama sesi live (signature = sampel, bukan semua panggilan)")
-    for _, r in ipairs(rows) do
-        local s = r[2]
-        w.add(("%s  OUT=%d IN=%d peak=%d/s%s"):format(r[1], s.out, s.inn, s.peak or 0, s.blocked > 0 and (" BLOCKED=" .. s.blocked) or ""))
-        local sigs = {}
-        for sg, n in next, s.sigs do sigs[#sigs + 1] = ("%s x%d"):format(sg, n) end
-        table.sort(sigs)
-        for _, sg in ipairs(sigs) do w.add("    sig: " .. sg) end
-        for cp, n in next, s.callers do w.add(("    caller: %s x%d"):format(cp, n)) end
-        for _, ln in ipairs(L.profLines(s)) do w.add("    " .. ln) end
-        if s.sample then w.add("    contoh: " .. s.sample) end
-    end
-    w.close()
-    LOG.add("info", ("remote_stats ditulis (%d remote)"):format(#rows))
 end
 
 function L.profLines(s)
@@ -2564,10 +2935,11 @@ function L.profLines(s)
     return out
 end
 
--- katalog remote dalam Markdown (ditulis sekali, saat live berhenti)
-function L.writeCatalog()
-    if not CAN_WRITE or next(L.rstat) == nil then return end
-    local w = W.new("remote_catalog_" .. os.date("%H%M%S"), "md", "live")
+-- v6: statistik + katalog ditulis ke file tetap per sesi (ditimpa), jadi bisa di-autosave tanpa menumpuk file
+function L.save(announce)
+    if not CAN_WRITE or next(L.rstat) == nil or not W.root then return end
+    local dir = W.root .. "/live"
+    pcall(CAP.makefolder, dir)
     local rows = {}
     for p, s in next, L.rstat do rows[#rows + 1] = { p, s } end
     table.sort(rows, function(a, b)
@@ -2575,44 +2947,77 @@ function L.writeCatalog()
         if ta ~= tb then return ta > tb end
         return a[1] < b[1]
     end)
-    w.add("# Katalog remote (dari sesi live)")
-    w.add("Catatan: berdasarkan sampel panggilan yang teramati; tipe / rentang / enum bisa belum lengkap.")
-    w.add("")
+
+    local a = { "# statistik remote selama sesi live (signature = sampel, bukan semua panggilan)" }
+    local c = {
+        "# Katalog remote (dari sesi live)",
+        "Catatan: berdasarkan sampel panggilan yang teramati; tipe / rentang / enum bisa belum lengkap.",
+        "",
+    }
     for _, r in ipairs(rows) do
         local s = r[2]
-        w.add(("## `%s`"):format(r[1]))
-        w.add(("- panggilan: OUT %d / IN %d | puncak %d/s%s"):format(s.out, s.inn, s.peak or 0, s.blocked > 0 and (" | diblok " .. s.blocked) or ""))
-        for cp, n in next, s.callers do w.add(("- caller: `%s` x%d"):format(cp, n)) end
-        for _, ln in ipairs(L.profLines(s)) do w.add("- " .. ln) end
-        if s.sample then w.add("- contoh: `" .. (s.sample:gsub("`", "'")) .. "`") end
-        w.add("")
+        local prof = L.profLines(s)
+
+        a[#a + 1] = ("%s  OUT=%d IN=%d peak=%d/s%s"):format(r[1], s.out, s.inn, s.peak or 0, s.blocked > 0 and (" BLOCKED=" .. s.blocked) or "")
+        local sigs = {}
+        for sg, n in next, s.sigs do sigs[#sigs + 1] = ("%s x%d"):format(sg, n) end
+        table.sort(sigs)
+        for _, sg in ipairs(sigs) do a[#a + 1] = "    sig: " .. sg end
+        for cp, n in next, s.callers do a[#a + 1] = ("    caller: %s x%d"):format(cp, n) end
+        for _, ln in ipairs(prof) do a[#a + 1] = "    " .. ln end
+        if s.sample then a[#a + 1] = "    contoh: " .. s.sample end
+
+        c[#c + 1] = ("## `%s`"):format(r[1])
+        c[#c + 1] = ("- panggilan: OUT %d / IN %d | puncak %d/s%s"):format(s.out, s.inn, s.peak or 0, s.blocked > 0 and (" | diblok " .. s.blocked) or "")
+        for cp, n in next, s.callers do c[#c + 1] = ("- caller: `%s` x%d"):format(cp, n) end
+        for _, ln in ipairs(prof) do c[#c + 1] = "- " .. ln end
+        if s.sample then c[#c + 1] = "- contoh: `" .. (s.sample:gsub("`", "'")) .. "`" end
+        c[#c + 1] = ""
     end
-    w.close()
-    LOG.add("info", ("remote_catalog ditulis (%d remote)"):format(#rows))
+    pcall(CAP.writefile, ("%s/remote_stats_%s.txt"):format(dir, L.tag), table.concat(a, "\n"))
+    pcall(CAP.writefile, ("%s/remote_catalog_%s.md"):format(dir, L.tag), table.concat(c, "\n"))
+    if announce then LOG.add("info", ("remote_stats + remote_catalog tersimpan (%d remote)"):format(#rows)) end
+end
+
+-- flush log + simpan stats sekarang juga (tombol Simpan, API LiveSave, event teleport)
+function L.flushNow()
+    if L.wLog then L.wLog.close() end
+    if L.wJson then L.wJson.close() end
+    pcall(L.save, false)
+    W.flushAll()
+    return true
 end
 
 function L.loop()
-    local lastFlush = os.clock()
-    while L.on and not APP.dead do
-        task.wait(0.12)
+    L.run += 1
+    local my = L.run
+    local lastFlush, lastSave = os.clock(), os.clock()
+    while L.on and not APP.dead and L.run == my do
+        task.wait() -- per frame (v5: 0.12 dtk) supaya antrean tidak penuh saat remote ramai
         if os.clock() - L.winT >= 1 then L.win, L.winT = {}, os.clock() end
         local t0 = os.clock()
-        while L.qh < L.qt and os.clock() - t0 < 0.01 do
+        while L.qh < L.qt and os.clock() - t0 < CFG.LiveBudget do
             L.qh += 1
             local it = L.q[L.qh]
             L.q[L.qh] = nil
             pcall(L.process, it)
         end
         if L.qh >= L.qt then L.qh, L.qt = 0, 0 end
-        if os.clock() - lastFlush >= CFG.LiveFlushSec then
-            lastFlush = os.clock()
+        local now = os.clock()
+        if now - lastFlush >= CFG.LiveFlushSec then
+            lastFlush = now
             if L.wLog then L.wLog.close() end
             if L.wJson then L.wJson.close() end
         end
+        if (CFG.LiveAutosaveSec or 0) > 0 and now - lastSave >= CFG.LiveAutosaveSec then
+            lastSave = now
+            pcall(L.save, false)
+        end
     end
+    if L.run ~= my then return end -- loop baru sudah menggantikan (stop lalu start cepat)
     -- habiskan sisa antrean sebelum menutup
     local t1 = os.clock()
-    while L.qh < L.qt and os.clock() - t1 < 1 do
+    while L.qh < L.qt and os.clock() - t1 < 1.5 do
         L.qh += 1
         local it = L.q[L.qh]
         L.q[L.qh] = nil
@@ -2620,8 +3025,7 @@ function L.loop()
     end
     if L.wLog then L.wLog.close() end
     if L.wJson then L.wJson.close() end
-    pcall(L.writeStats)
-    pcall(L.writeCatalog)
+    pcall(L.save, true)
 end
 
 function L.start()
@@ -2630,41 +3034,54 @@ function L.start()
     L.on, L.epoch = true, os.time() - os.clock()
     L.q, L.qh, L.qt, L.dropped, L.stats, L.feed = {}, 0, 0, 0, {}, {}
     L.muted, L.win, L.winT, L.watchN = {}, {}, os.clock(), 0
+    L.thr, L.dropTotal, L.seq, L.dd = {}, 0, 0, {}
     L.rstat, L.rstatN = {}, 0
     L.fm = {}
     L.wLog, L.wJson = nil, nil
+    L.tag = os.date("%H%M%S") -- tiap sesi live punya file sendiri
     if CAN_WRITE then
-        local tag = os.date("%H%M%S") -- tiap sesi live punya file sendiri (v3 menimpa sesi sebelumnya)
-        L.wLog = W.new("events_" .. tag, "log", "live")
-        L.wJson = (CFG.LiveJSONL and HttpService) and W.new("events_" .. tag, "jsonl", "live") or nil
+        L.wLog = W.new("events_" .. L.tag, "log", "live")
+        L.wJson = (CFG.LiveJSONL and HttpService) and W.new("events_" .. L.tag, "jsonl", "live") or nil
     else
         LOG.add("warn", "tanpa writefile: live tidak disimpan ke file (hanya tampil di UI)")
     end
     local o = CFG.Live
     if o.remotes then
-        ENV.DumperPP_Hook4, ENV.DumperPP_Ret4 = L.hook, L.ret
-        if not ensureHook() then LOG.add("warn", "hookmetamethod tidak tersedia: live hanya menangkap remote IN") end
-        for _, r in ipairs(INDEX.remotes) do L.hookIn(r) end
+        ENV.DumperPP_Hook6, ENV.DumperPP_Ret6 = L.hook, L.ret
+        if not ensureHook() then LOG.add("warn", "hookmetamethod / hookfunction tidak tersedia: live hanya menangkap remote IN") end
+        for _, r in ipairs(INDEX.remotes) do
+            L.hookIn(r)
+            if o.invokes then L.hookInvoke(r) end
+        end
     end
     if o.values then
         for _, v in ipairs(INDEX.values) do L.watchValue(v) end
         for _, a in ipairs(INDEX.attrs) do L.watchAttr(a) end
     end
+    if o.props then L.watchPlayer() end
     L.conns[#L.conns + 1] = game.DescendantAdded:Connect(L.onAdded)
     if o.instances then L.conns[#L.conns + 1] = game.DescendantRemoving:Connect(L.onRemoving) end
+    -- simpan semuanya sebelum teleport (game lama tidak akan memanggil Stop)
+    local lp = Players and Players.LocalPlayer
+    if lp then
+        local okT, sig = pcall(function() return lp.OnTeleport end)
+        if okT and sig then L.conns[#L.conns + 1] = sig:Connect(function() pcall(L.flushNow) end) end
+    end
     task.spawn(L.loop)
-    LOG.add("info", ("live aktif | scope: %s | diawasi: %d | log: %s/live"):format(
-        SC.active() and "sistem terpilih" or "seluruh game", L.watchN, W.root or "-"))
+    LOG.add("info", ("live aktif | scope: %s | diawasi: %d | hook: %s | log: %s/live"):format(
+        SC.active() and "sistem terpilih" or "seluruh game", L.watchN,
+        ENV.DumperPP_HookInstalled6 and "ok" or "tidak ada", W.root or "-"))
 end
 
 function L.stop()
     if not L.on then return end
     L.on = false
-    ENV.DumperPP_Hook4, ENV.DumperPP_Ret4 = nil, nil
+    ENV.DumperPP_Hook6, ENV.DumperPP_Ret6 = nil, nil
     for _, c in ipairs(L.conns) do pcall(function() c:Disconnect() end) end
     L.conns, L.hooked, L.watched = {}, setmetatable({}, { __mode = "k" }), setmetatable({}, { __mode = "k" })
+    L.pw = setmetatable({}, { __mode = "k" })
     task.delay(0.3, function() W.flushAll() end)
-    LOG.add("info", "live dihentikan, log + remote_stats tersimpan")
+    LOG.add("info", "live dihentikan, log + remote_stats + remote_catalog tersimpan")
 end
 onCleanup(function() L.on = false end)
 onCleanup(function() for _, c in ipairs(L.conns) do pcall(function() c:Disconnect() end) end end)
@@ -2678,6 +3095,7 @@ function L.toCode(e)
     if e.kind == "OUT" then
         return ("%s:%s(%s)"):format(ref, e.method, table.concat(args, ", "))
     end
+    if e.method ~= "OnClientEvent" then return e.detail or "" end
     -- event IN: simulasi sisi client (butuh firesignal)
     return ("firesignal(%s.OnClientEvent%s)"):format(ref, #args > 0 and (", " .. table.concat(args, ", ")) or "")
 end
@@ -2691,7 +3109,7 @@ function L.replay(e)
             if not ok then LOG.add("warn", "replay gagal: " .. tostring(err)) end
         end)
         return true, "replay terkirim: " .. memoPath(inst)
-    elseif e.kind == "IN " and CAP.firesignal then
+    elseif e.kind == "IN " and m == "OnClientEvent" and CAP.firesignal then
         local ok, err = pcall(CAP.firesignal, inst.OnClientEvent, table.unpack(raw, 1, raw.n))
         if not ok then LOG.add("warn", "firesignal gagal: " .. tostring(err)) return false, "firesignal gagal" end
         return true, "firesignal terkirim: " .. memoPath(inst)
@@ -2706,8 +3124,25 @@ function L.toggleBlock(e)
     return on, memoPath(e.inst)
 end
 
+-- v6: sembunyikan semua event dari path ini (IN/OUT/RET) sampai "Unmute"
+function L.ignore(e)
+    if not (e and e.inst) then return nil end
+    local p = memoPath(e.inst)
+    L.muted["OUT" .. p], L.muted["IN " .. p], L.muted["RET" .. p] = true, true, true
+    return p
+end
+
+-- v6: tampilkan HANYA path ini (mengisi filter include)
+function L.focus(e)
+    if not (e and e.inst) then return nil end
+    local p = memoPath(e.inst):lower()
+    CFG.LiveFilter = { include = { p }, exclude = {} }
+    L.fm = {}
+    return p
+end
+
 ---------------------------------------------------------------------
--- 5b. PENCARIAN (instance / remote / konstanta GC)
+-- 5b. PENCARIAN (instance / remote / isi script / konstanta GC)
 ---------------------------------------------------------------------
 local SR = {}
 
@@ -2853,6 +3288,7 @@ local T = {
 local KIND_COLOR = {
     ["OUT"] = Color3.fromRGB(245, 170, 90), ["IN "] = T.blue, VAL = T.accent, ATR = Color3.fromRGB(90, 210, 210),
     ADD = Color3.fromRGB(190, 140, 255), DEL = T.bad, NOTE = T.warn, RET = Color3.fromRGB(255, 130, 190),
+    PRP = Color3.fromRGB(150, 200, 120),
 }
 
 local UI = {}
@@ -2954,7 +3390,7 @@ end
 function UI.build()
     if splash.gui then pcall(function() splash.gui:Destroy() end) end
     local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
-    local WW, HH = math.min(460, vp.X - 20), math.min(580, vp.Y - 40)
+    local WW, HH = math.min(500, vp.X - 20), math.min(660, vp.Y - 40)
 
     local gui = new("ScreenGui", { Name = HttpService and HttpService:GenerateGUID(false) or "DumperPP", ResetOnSpawn = false, DisplayOrder = 2147483647, IgnoreGuiInset = true })
     APP.gui = gui
@@ -2966,7 +3402,7 @@ function UI.build()
 
     -- title bar (drag)
     local title = new("Frame", { Size = UDim2.new(1, 0, 0, 34), BackgroundColor3 = T.panel, BorderSizePixel = 0 }, main)
-    label(title, ("Dumper++ v%s  Zenith"):format(VERSION), { Size = UDim2.new(1, -90, 1, 0), Position = UDim2.fromOffset(12, 0), Font = Enum.Font.GothamBold, TextSize = 14, TextWrapped = false })
+    label(title, ("Dumper++ v%s  Overdrive"):format(VERSION), { Size = UDim2.new(1, -90, 1, 0), Position = UDim2.fromOffset(12, 0), Font = Enum.Font.GothamBold, TextSize = 14, TextWrapped = false })
     local collapsed = false
     local body = new("Frame", { Size = UDim2.new(1, 0, 1, -34), Position = UDim2.fromOffset(0, 34), BackgroundTransparency = 1 }, main)
     button(title, "-", function()
@@ -3125,12 +3561,15 @@ function UI.build()
         { "modules_return", "Return ModuleScript (yang sudah load)", CAP.getloadedmodules ~= nil },
         { "senv", "Script environment (getsenv)", CAP.getsenv ~= nil },
         { "gc", "Garbage collector (fungsi + tabel)", CAP.getgc ~= nil },
-        { "remotes", "Remote + handler client", true },
+        { "remotes", "Remote + handler client + remotes_api.lua", true },
         { "gui", "GUI: tombol + koneksi handler", true },
         { "prompts", "ProximityPrompt / ClickDetector", true },
         { "player", "Snapshot pemain lokal", true },
-        { "callsites", "Callsite remote statis (butuh Script)", true },
-        { "strings", "String / URL / asset + profil script (butuh Script)", true },
+        { "callsites", "Callsite remote statis + alias (butuh Script)", true },
+        { "strings", "String / URL / asset / attribute / tag (butuh Script)", true },
+        { "assets", "Aset instance (anim / sound / gambar / mesh)", true },
+        { "gameinfo", "Info game + setting service + Teams", true },
+        { "require_unloaded", "Require modul belum-load (data murni) [berisiko]", CAP.decompile ~= nil },
         { "saveinstance", "saveinstance() bawaan executor", CAP.saveinstance ~= nil },
     }
     for _, m in ipairs(MODS) do
@@ -3172,10 +3611,16 @@ function UI.build()
     local ctl = new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, lv)
     new("UIListLayout", { Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder }, ctl)
     new("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8), PaddingTop = UDim.new(0, 8) }, ctl)
-    toggle(ctl, "Remote spy (IN + OUT + caller)", function() return CFG.Live.remotes end, function(v) CFG.Live.remotes = v end)
-    toggle(ctl, "Value + attribute watcher", function() return CFG.Live.values end, function(v) CFG.Live.values = v end)
-    toggle(ctl, "Instance spawn / hapus", function() return CFG.Live.instances end, function(v) CFG.Live.instances = v end)
-    toggle(ctl, "Tangkap return InvokeServer", function() return CFG.Live.returns end, function(v) CFG.Live.returns = v end, CAP.hookmetamethod ~= nil)
+    -- toggle dua kolom supaya feed tetap lega
+    local tgrid = ordered(ctl, new("Frame", { Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1 }, ctl))
+    new("UIGridLayout", { CellSize = UDim2.new(0.5, -3, 0, 26), CellPadding = UDim2.fromOffset(6, 4), SortOrder = Enum.SortOrder.LayoutOrder }, tgrid)
+    toggle(tgrid, "Spy remote (IN+OUT)", function() return CFG.Live.remotes end, function(v) CFG.Live.remotes = v end)
+    toggle(tgrid, "Value + attribute", function() return CFG.Live.values end, function(v) CFG.Live.values = v end)
+    toggle(tgrid, "Humanoid props", function() return CFG.Live.props end, function(v) CFG.Live.props = v end)
+    toggle(tgrid, "Spawn / hapus instance", function() return CFG.Live.instances end, function(v) CFG.Live.instances = v end)
+    toggle(tgrid, "Return InvokeServer", function() return CFG.Live.returns end, function(v) CFG.Live.returns = v end, CAP.hookmetamethod ~= nil or CAP.hookfunction ~= nil)
+    toggle(tgrid, "Hook fungsi langsung", function() return CFG.Live.hookfn end, function(v) CFG.Live.hookfn = v end, CAP.hookfunction ~= nil)
+    toggle(tgrid, "Hook OnClientInvoke", function() return CFG.Live.invokes end, function(v) CFG.Live.invokes = v end, CAP.hookfunction ~= nil and CAP.getcallbackvalue ~= nil)
     local fbox = ordered(ctl, new("TextBox", {
         Size = UDim2.new(1, 0, 0, 28), BackgroundColor3 = T.panel, TextColor3 = T.text,
         PlaceholderText = "filter path: kata,kata  (awali - untuk kecualikan: -spam)", PlaceholderColor3 = T.dim,
@@ -3222,19 +3667,25 @@ function UI.build()
             L.start()
             if L.on then liveBtn.Text, liveBtn.BackgroundColor3 = "STOP", T.bad end
         end
-    end, { Size = UDim2.new(0.25, -3, 1, 0), BackgroundColor3 = T.accent, TextColor3 = T.bg, TextSize = 12, Font = Enum.Font.GothamBold })
+    end, { Size = UDim2.new(0.2, -3, 1, 0), BackgroundColor3 = T.accent, TextColor3 = T.bg, TextSize = 12, Font = Enum.Font.GothamBold })
     pauseBtn = button(brow, "Pause UI", function()
         paused = not paused
         pauseBtn.Text = paused and "Lanjut UI" or "Pause UI"
-    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    end, { Size = UDim2.new(0.2, -3, 1, 0), TextSize = 12 })
     local feedFrame
     button(brow, "Bersihkan", function()
         for _, c in ipairs(feedFrame:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
-    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    end, { Size = UDim2.new(0.2, -3, 1, 0), TextSize = 12 })
     button(brow, "Unmute", function()
-        L.muted = {}
-        setStatus("mute dibersihkan", nil, T.accent)
-    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+        L.muted, L.thr, L.dropTotal = {}, {}, 0
+        setStatus("abaikan + throttle dibersihkan", nil, T.accent)
+    end, { Size = UDim2.new(0.2, -3, 1, 0), TextSize = 12 })
+    button(brow, "Simpan", function()
+        task.spawn(function()
+            L.flushNow()
+            setStatus("log + remote_stats + katalog disimpan", nil, T.accent)
+        end)
+    end, { Size = UDim2.new(0.2, -3, 1, 0), TextSize = 12, BackgroundColor3 = T.blue, TextColor3 = T.bg })
     local statLbl = ordered(ctl, label(ctl, "live belum aktif | log: live/events_<jam>.log + .jsonl + remote_stats", { Size = UDim2.new(1, 0, 0, 16), TextSize = 11, TextColor3 = T.dim, Font = Enum.Font.Code, TextWrapped = false }))
 
     feedFrame = new("ScrollingFrame", {
@@ -3245,8 +3696,9 @@ function UI.build()
     new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 1) }, feedFrame)
     new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4), PaddingTop = UDim.new(0, 4) }, feedFrame)
     ORD[feedFrame] = 0
-    local actRow = new("Frame", { Size = UDim2.new(1, -16, 0, 28), Position = UDim2.new(0, 8, 1, -34), BackgroundTransparency = 1 }, lv)
-    new("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4) }, actRow)
+    -- 6 tombol aksi: grid 3 x 2
+    local actRow = new("Frame", { Size = UDim2.new(1, -16, 0, 56), Position = UDim2.new(0, 8, 1, -62), BackgroundTransparency = 1 }, lv)
+    new("UIGridLayout", { CellSize = UDim2.new(1 / 3, -3, 0, 26), CellPadding = UDim2.fromOffset(4, 4), SortOrder = Enum.SortOrder.LayoutOrder }, actRow)
     pages.live = lv
 
     -- feed mengisi sisa ruang di bawah panel kontrol (tinggi panel berubah mengikuti isi)
@@ -3254,7 +3706,7 @@ function UI.build()
         local y = ctl.AbsoluteSize.Y + 4
         if y < 60 then return end
         feedFrame.Position = UDim2.fromOffset(8, y)
-        feedFrame.Size = UDim2.new(1, -16, 1, -(y + 40))
+        feedFrame.Size = UDim2.new(1, -16, 1, -(y + 70))
     end
     ctl:GetPropertyChangedSignal("AbsoluteSize"):Connect(relayout)
 
@@ -3273,17 +3725,17 @@ function UI.build()
     end
     button(actRow, "Detail", function()
         if need() then copy(sel.detail, "detail disalin") end
-    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    end, { TextSize = 12 })
     button(actRow, "Kode", function()
         if not need() then return end
         local okc, code = pcall(L.toCode, sel)
         if okc then copy(code, "kode Lua disalin") else setStatus("gagal membuat kode", nil, T.bad) end
-    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    end, { TextSize = 12 })
     button(actRow, "Replay", function()
         if not need() then return end
         local okr, msg = L.replay(sel)
         setStatus(msg or "", nil, okr and T.accent or T.warn)
-    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    end, { TextSize = 12 })
     button(actRow, "Block", function()
         if not need() then return end
         local on, p = L.toggleBlock(sel)
@@ -3292,14 +3744,29 @@ function UI.build()
         else
             setStatus((on and "BLOCK aktif (selama Live jalan): " or "block dilepas: ") .. p, nil, on and T.bad or T.accent)
         end
-    end, { Size = UDim2.new(0.25, -3, 1, 0), TextSize = 12 })
+    end, { TextSize = 12 })
+    button(actRow, "Abaikan path", function()
+        if not need() then return end
+        local p = L.ignore(sel)
+        setStatus(p and ("diabaikan (Unmute untuk batal): " .. p) or "tidak bisa diabaikan", nil, p and T.accent or T.warn)
+    end, { TextSize = 12 })
+    button(actRow, "Fokus path ini", function()
+        if not need() then return end
+        local p = L.focus(sel)
+        if p then
+            fbox.Text = p
+            saveSettings()
+            setStatus("filter live: hanya " .. p, nil, T.accent)
+        end
+    end, { TextSize = 12 })
 
     local function pumpFeed()
         local feed = L.feed
         if #feed == 0 then return end
         L.feed = {}
         if paused then return end
-        for _, e in ipairs(feed) do
+        for i = math.max(1, #feed - CFG.LiveFeedPerTick + 1), #feed do
+            local e = feed[i]
             local row = ordered(feedFrame, new("TextButton", {
                 Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
                 Text = e.line, TextColor3 = KIND_COLOR[e.kind] or T.text, Font = Enum.Font.Code, TextSize = 11,
@@ -3318,9 +3785,9 @@ function UI.build()
             task.wait(0.25)
             pcall(pumpFeed)
             if L.on or next(L.stats) then
-                statLbl.Text = ("OUT %d | IN %d | RET %d | VAL %d | ATR %d | watch %d | drop %d | mute %d"):format(
-                    L.stats.OUT or 0, L.stats["IN "] or 0, L.stats.RET or 0, L.stats.VAL or 0, L.stats.ATR or 0,
-                    L.watchN, L.dropped, (function() local n = 0 for _ in next, L.muted do n += 1 end return n end)())
+                statLbl.Text = ("OUT %d | IN %d | RET %d | VAL %d | ATR %d | PRP %d | watch %d | q-drop %d | throttle %d | ignore %d"):format(
+                    L.stats.OUT or 0, L.stats["IN "] or 0, L.stats.RET or 0, L.stats.VAL or 0, L.stats.ATR or 0, L.stats.PRP or 0,
+                    L.watchN, L.dropped, L.dropTotal, (function() local n = 0 for _ in next, L.muted do n += 1 end return n end)())
             end
         end
     end)
@@ -3497,6 +3964,7 @@ function APP.Search(mode, q)
 end
 function APP.LiveStart() return L.start() end
 function APP.LiveStop() return L.stop() end
+function APP.LiveSave() return L.flushNow() end
 APP.CFG, APP.SCAN, APP.INDEX, APP.LIVE, APP.SRC = CFG, SCAN, INDEX, L, SRC
 
 task.spawn(function()

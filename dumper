@@ -1,4 +1,25 @@
 --[[
+    DUMPER++ v6 "Overdrive" + PLUS v8  |  satu file (Luau / executor)
+
+    Cukup execute file ini sekali. Isinya: Dumper++ v6 apa adanya (tidak diubah) + add-on Plus v8 di bagian paling
+    bawah (bagian 8) yang langsung menempel ke v6 dan menampilkan panel "Dumper++ Plus" di dalam UI v6.
+    Kalau bagian Plus gagal dimuat, v6 tetap jalan normal dan pesan error keluar lewat warn().
+
+    Plus (v7 + v8)
+      * Stack trace tiap remote OUT di Live spy (SCRIPT:BARIS fungsi pemanggil) -> Detail, events.jsonl ("stack"), live_origins
+      * Penanda (Tandai) : sisipkan "=== teks ===" ke log live
+      * Laporan penanda  : remote apa yang muncul sesudah tiap penanda; label sama diulang -> peringkat konsistensi (marker_report.md)
+      * Riwayat live     : 8000 event terakhir di memori, dicari lewat tombol "Live" (remote mana yang membawa teks / angka itu)
+      * Script baru otomatis di-decompile saat Live aktif (event SCR)
+      * Analisis penuh   : remote_protocol.md (+ konteks kode tiap callsite) + remote_protocol.json + remote_graph.mmd (statis + live)
+                           + obfuscation.txt  -> workspace/DumpPP/Plus/<PlaceId>_<tanggal_jam>/
+      * Pencarian tambahan: Source dengan pola Lua (awali "re:"), Attribute, Value, Live
+    API Plus : getgenv().DumperPP_Plus = { Analyze(progress), Mark(teks), Search(mode: src | attr | val | evt),
+                                          MarkerReport(jendela_detik), cfg, Destroy() }
+               cfg: trace, newscripts, timeline (true/false), traceDepth, corrWindow (detik, default 3)
+]]
+
+--[[
     DUMPER++ v6 "Overdrive"  |  Roblox universal dumper + live monitor + analyzer (Luau / executor)
 
     Alur    : load -> SCAN sistem di map -> UI dibangun dari hasil scan -> pilih sistem & modul -> Dump / Live / Cari
@@ -4006,3 +4027,1452 @@ task.spawn(function()
         if splash.gui then pcall(function() splash.gui:Destroy() end) end
     end
 end)
+
+---------------------------------------------------------------------
+-- 8. PLUS v8 (add-on digabung ke file ini; dibungkus pcall supaya kalau gagal, v6 tetap jalan)
+---------------------------------------------------------------------
+local okPlus, errPlus = pcall(function()
+--[[
+    DUMPER++ PLUS v8  |  add-on untuk Dumper++ v6 "Overdrive"  (Luau / executor)
+
+    Digabung: sudah menempel otomatis ke Dumper++ v6 di file ini (tidak perlu execute file lain).
+              Panel "Dumper++ Plus" muncul DI DALAM UI v6, ikut hilang / muncul dengan RightControl
+              dan ikut dibersihkan kalau v6 di-Destroy / di-execute ulang.
+
+    Output  : workspace/DumpPP/Plus/<PlaceId>_<tanggal_jam>/
+                remote_protocol.md    dokumen per remote: callsite statis + handler + profil argumen live + asal panggilan
+                remote_graph.mmd      graf Mermaid script -> remote (FireServer / InvokeServer) dan remote -> handler
+                obfuscation.txt       peringkat script yang kemungkinan di-obfuscate / banyak kode dinamis
+                live_origins_<jam>.txt asal panggilan (stack teratas) tiap remote OUT, ikut autosave live v6
+
+    BARU di v8 (dibanding v7)
+      * Korelasi penanda -> remote: marker_report.md. Tiap penanda dicocokkan dengan remote yang muncul sesudahnya
+        (jendela cfg.corrWindow detik). Penanda berlabel sama yang diulang -> peringkat "muncul k dari n kali"
+        dan remote yang muncul di hampir semua penanda ditandai bising.
+      * Riwayat live (timeline) disimpan di memori (8000 event terakhir) dan bisa dicari: Search("evt", teks)
+        -> remote mana yang membawa teks / angka tertentu, dari script mana.
+      * Konteks kode: tiap callsite / handler di remote_protocol.md membawa 2 baris sebelum + 2-3 baris sesudah.
+      * remote_protocol.json: seluruh protokol (statis + live + asal panggilan) dalam JSON untuk dipakai alat lain.
+      * remote_graph.mmd ikut memuat sisi "live" (script asal stack -> remote) dan ikut diperbarui saat autosave.
+      * Ringkasan live di kepala remote_protocol.md: 10 remote teramai, jumlah remote bising (puncak >= 20/dtk).
+    BARU di v7 (dibanding v6)
+      1. Stack trace pada tiap remote OUT di Live spy: tahu SCRIPT:BARIS fungsi mana yang memanggil, bukan cuma
+         script pemanggil. Masuk ke Detail, events.jsonl (field "stack"), dan live_origins. Dibatasi 5 trace/detik
+         per remote supaya remote yang ramai tidak membebani game.
+      2. Penanda (Tandai): sisipkan baris "=== teks ===" ke log live di saat kamu melakukan sesuatu di game,
+         supaya mudah mencocokkan aksi dengan remote yang muncul sesudahnya.
+      3. Script baru otomatis di-decompile saat Live aktif (mis. UI / modul yang baru ter-stream). Hasilnya masuk
+         cache decompile v6, jadi pencarian Source berikutnya instan. Event SCR muncul di feed.
+      4. Analisis penuh satu tombol: remote_protocol.md + remote_graph.mmd + obfuscation.txt. Dokumen protokol
+         otomatis diperbarui ikut autosave live, jadi data live masuk ke dokumen tanpa langkah tambahan.
+      5. Pencarian tambahan: Source dengan pola Lua (awali "re:", mis. re:FireServer%(.-"Buy"), Attribute
+         (nama / nilai), dan Value (nama / nilai).
+
+    Butuh   : Dumper++ v6 (struktur internalnya dipakai). Executor dengan writefile + makefolder untuk file keluaran.
+              getscripts / getloadedmodules / decompile membuat analisis lebih lengkap; yang tidak ada dilewati.
+    API     : getgenv().DumperPP_Plus = { Analyze(progress), Mark(teks), Search(mode, q), MarkerReport(jendela), cfg, Destroy() }
+              Search mode: src | attr | val | evt   (src menerima "re:pola"; evt = riwayat remote live)
+]]
+
+local ENV = (getgenv and getgenv()) or getfenv()
+local VERSION = "8.0"
+
+if type(ENV.DumperPP_Plus) == "table" and type(ENV.DumperPP_Plus.Destroy) == "function" then
+    pcall(ENV.DumperPP_Plus.Destroy)
+end
+
+local cloneref = ENV.cloneref or function(x) return x end
+local function svc(name)
+    local ok, s = pcall(function() return cloneref(game:GetService(name)) end)
+    return ok and s or nil
+end
+local Players, UIS = svc("Players"), svc("UserInputService")
+local CoreGui, CorePackages = svc("CoreGui"), svc("CorePackages")
+local CAN_WRITE = (ENV.writefile and ENV.makefolder) and true or false
+
+local P = {
+    alive = true, app = nil, dir = nil, static = nil,
+    cfg = { trace = true, newscripts = true, traceDepth = 6, timeline = true, corrWindow = 3 },
+    patches = {}, uiConns = {}, stk = {}, stkN = 0, tc = nil, tcSec = -1, scrN = 0, skip = {},
+    tl = {}, tlN = 0, ctxTotal = 0, lastHeavy = -1e9,
+}
+ENV.DumperPP_Plus = P
+
+-- warna baris feed untuk jenis event baru (UI v6 memakai KIND_COLOR[e.kind] or T.text)
+if type(KIND_COLOR) == "table" then
+    KIND_COLOR.MRK = Color3.fromRGB(255, 225, 90)
+    KIND_COLOR.SCR = Color3.fromRGB(120, 200, 255)
+end
+
+local MYSRC
+do
+    local ok, s = pcall(debug.info, function() end, "s")
+    if ok and type(s) == "string" then MYSRC = s end
+end
+
+---------------------------------------------------------------------
+-- util
+---------------------------------------------------------------------
+local function clean(s) return (tostring(s):gsub("%c", " ")) end
+
+local function pathOf(inst)
+    local ok, p = pcall(inst.GetFullName, inst)
+    return ok and p or "<?>"
+end
+
+local function inCore(s)
+    local ok, r = pcall(function()
+        return (CoreGui and s:IsDescendantOf(CoreGui)) or (CorePackages and s:IsDescendantOf(CorePackages))
+    end)
+    return ok and r == true
+end
+
+local LUA_KW = {}
+for w in ("and break do else elseif end false for function if in local nil not or repeat return then true until while continue"):gmatch("%a+") do
+    LUA_KW[w] = true
+end
+
+-- ekspresi Lua yang menunjuk ke instance (dipakai sebagai teks "salin" di hasil pencarian)
+local function luaRef(inst)
+    local chain, cur, guard = {}, inst, 0
+    while cur and cur ~= game and guard < 120 do
+        guard += 1
+        table.insert(chain, 1, cur.Name)
+        cur = cur.Parent
+    end
+    if cur ~= game then return "nil --[[instance di luar game]]" end
+    if #chain == 0 then return "game" end
+    local lp = Players and Players.LocalPlayer
+    local out, start
+    if lp and chain[1] == "Players" and chain[2] == lp.Name then
+        out, start = 'game:GetService("Players").LocalPlayer', 3
+    else
+        local okS = pcall(game.GetService, game, chain[1])
+        out = okS and ("game:GetService(%q)"):format(chain[1]) or ("game[%q]"):format(chain[1])
+        start = 2
+    end
+    for i = start, #chain do
+        local seg = chain[i]
+        if seg:match("^[%a_][%w_]*$") and not LUA_KW[seg] then
+            out ..= "." .. seg
+        else
+            out ..= ("[%q]"):format(seg)
+        end
+    end
+    return out
+end
+
+local function outDir()
+    if P.dir then return P.dir end
+    if not CAN_WRITE then return nil end
+    local base = ("DumpPP/Plus/%d_%s"):format(game.PlaceId, os.date("%Y%m%d_%H%M%S"))
+    pcall(ENV.makefolder, "DumpPP")
+    pcall(ENV.makefolder, "DumpPP/Plus")
+    pcall(ENV.makefolder, base)
+    P.dir = base
+    return base
+end
+
+local function save(name, text)
+    local d = outDir()
+    if not d then return false end
+    local ok = pcall(ENV.writefile, d .. "/" .. name, text)
+    return ok
+end
+
+-- iterasi baris; fn(line, no) -> true = berhenti
+local function lineIter(body, fn)
+    local pos, ln = 1, 0
+    while true do
+        local e = body:find("\n", pos, true)
+        ln += 1
+        if fn(body:sub(pos, (e or 0) - 1), ln) then return end
+        if not e then return end
+        pos = e + 1
+        if ln % 4000 == 0 then task.wait() end
+    end
+end
+
+local function cnt(body, pat)
+    local n = 0
+    for _ in body:gmatch(pat) do n += 1 end
+    return n
+end
+
+-- encoder JSON kecil (tanpa HttpService): array bila t[1] ~= nil atau kosong, selain itu objek dengan kunci terurut
+local function jstr(s)
+    return '"' .. (s:gsub('[%c"\\]', function(c)
+        if c == '"' then return '\\"' end
+        if c == "\\" then return "\\\\" end
+        if c == "\n" then return "\\n" end
+        if c == "\r" then return "\\r" end
+        if c == "\t" then return "\\t" end
+        return ("\\u%04x"):format(c:byte())
+    end)) .. '"'
+end
+
+local function jenc(v, depth)
+    depth = depth or 0
+    local t = type(v)
+    if t == "nil" then return "null" end
+    if t == "boolean" then return v and "true" or "false" end
+    if t == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then return "null" end
+        if v == math.floor(v) and math.abs(v) < 1e15 then return ("%d"):format(v) end
+        return ("%.6g"):format(v)
+    end
+    if t == "string" then return jstr(v) end
+    if t ~= "table" or depth > 8 then return "null" end
+    local parts = {}
+    if next(v) == nil or v[1] ~= nil then
+        for i = 1, #v do parts[i] = jenc(v[i], depth + 1) end
+        return "[" .. table.concat(parts, ",") .. "]"
+    end
+    local keys = {}
+    for k in next, v do
+        if type(k) == "string" then keys[#keys + 1] = k end
+    end
+    table.sort(keys)
+    for i, k in ipairs(keys) do parts[i] = jstr(k) .. ":" .. jenc(v[k], depth + 1) end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function collectScripts(app)
+    local list, seen = {}, {}
+    local function add(s)
+        if typeof(s) ~= "Instance" or seen[s] then return end
+        local ok, cls = pcall(function() return s.ClassName end)
+        if ok and (cls == "LocalScript" or cls == "Script" or cls == "ModuleScript") and not inCore(s) then
+            seen[s] = true
+            list[#list + 1] = s
+        end
+    end
+    for _, s in ipairs(app.INDEX.scripts or {}) do add(s) end
+    if ENV.getscripts then
+        local ok, l = pcall(ENV.getscripts)
+        if ok and type(l) == "table" then for _, s in ipairs(l) do add(s) end end
+    end
+    if ENV.getloadedmodules then
+        local ok, l = pcall(ENV.getloadedmodules)
+        if ok and type(l) == "table" then for _, s in ipairs(l) do add(s) end end
+    end
+    return list
+end
+
+---------------------------------------------------------------------
+-- 1. stack trace pada remote OUT
+---------------------------------------------------------------------
+local function grabStack()
+    local out, depth = {}, P.cfg.traceDepth
+    if debug.info then
+        for lvl = 2, 45 do
+            local ok, src, line, name = pcall(debug.info, lvl, "sln")
+            if not ok or src == nil then break end
+            if type(src) == "string" and src ~= "[C]" and not P.skip[src]
+                and not src:find("^=") and not src:find("^%[string") then
+                local nm = (type(name) == "string" and name ~= "") and (" " .. name) or ""
+                out[#out + 1] = ("%s:%s%s"):format(clean(src):sub(1, 110), tostring(line), nm)
+                if #out >= depth then break end
+            end
+        end
+        if #out > 0 then return out end
+    end
+    if debug.traceback then
+        local ok, tb = pcall(debug.traceback)
+        if ok and type(tb) == "string" then
+            for line in tb:gmatch("[^\r\n]+") do
+                if line:find("%S") and not line:find("[C]", 1, true) and not line:find("[string ", 1, true)
+                    and not line:find("Stack Begin", 1, true) and not line:find("Stack End", 1, true) then
+                    out[#out + 1] = clean(line):sub(1, 140)
+                    if #out >= depth then break end
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- bungkus L.hook: kalau panggilan masuk antrean sebagai OUT (L.seq naik), simpan stack-nya per id
+local function patchHook(app)
+    local L = app.LIVE
+    local orig = L.hook
+    if type(orig) ~= "function" then return end
+    local okS, s6 = pcall(debug.info, orig, "s")
+    if okS and type(s6) == "string" then P.skip[s6] = true end
+    if MYSRC then P.skip[MYSRC] = true end
+    local wrapped
+    wrapped = function(via, self, m, ...)
+        local before = L.seq
+        local blocked, cap = orig(via, self, m, ...)
+        if P.cfg.trace and L.seq ~= before then
+            pcall(function()
+                local sec = math.floor(os.clock())
+                if P.tcSec ~= sec then
+                    P.tcSec, P.tc = sec, setmetatable({}, { __mode = "k" })
+                end
+                local c = (P.tc[self] or 0) + 1
+                P.tc[self] = c
+                if c <= 5 then
+                    local st = grabStack()
+                    if #st > 0 then
+                        if P.stkN > 3000 then P.stk, P.stkN = {}, 0 end
+                        P.stk[L.seq] = st
+                        P.stkN += 1
+                    end
+                end
+            end)
+        end
+        return blocked, cap
+    end
+    L.hook = wrapped
+    if L.on and ENV.DumperPP_Hook6 == orig then ENV.DumperPP_Hook6 = wrapped end
+    P.patches[#P.patches + 1] = function()
+        if L.hook == wrapped then L.hook = orig end
+        if ENV.DumperPP_Hook6 == wrapped then ENV.DumperPP_Hook6 = orig end
+    end
+end
+
+-- bungkus L.emit: tempelkan stack ke detail + jsonl dan hitung asal panggilan per remote
+local function patchEmit(app)
+    local L = app.LIVE
+    local orig = L.emit
+    if type(orig) ~= "function" then return end
+    local wrapped
+    wrapped = function(kind, line, detail, j, t, ex)
+        if kind == "OUT" and type(line) == "string" then
+            pcall(function()
+                local id = tonumber(line:match("^#(%d+) "))
+                local st = id and P.stk[id]
+                if not st then return end
+                P.stk[id] = nil
+                detail = (detail or "") .. "\nstack:\n  " .. table.concat(st, "\n  ")
+                if type(j) ~= "table" then return end
+                j.stack = st
+                local rs = L.rstat and L.rstat[j.path]
+                if rs and st[1] then
+                    rs.org = rs.org or {}
+                    local k = st[1]
+                    if rs.org[k] then
+                        rs.org[k] += 1
+                    elseif (rs.norg or 0) < 6 then
+                        rs.org[k] = 1
+                        rs.norg = (rs.norg or 0) + 1
+                    end
+                end
+            end)
+        end
+        if P.cfg.timeline and (kind == "OUT" or kind == "IN " or kind == "MRK") then
+            pcall(P.record, kind, j, t)
+        end
+        return orig(kind, line, detail, j, t, ex)
+    end
+    L.emit = wrapped
+    P.patches[#P.patches + 1] = function() if L.emit == wrapped then L.emit = orig end end
+end
+
+---------------------------------------------------------------------
+-- 2. penanda + script baru otomatis di-decompile
+---------------------------------------------------------------------
+-- timeline live di memori (8000 event terakhir): dasar laporan penanda dan Search("evt")
+function P.record(kind, j, t)
+    if type(j) ~= "table" or type(t) ~= "number" then return end
+    local a
+    if kind == "MRK" then
+        a = j.text
+    elseif type(j.args) == "table" then
+        a = table.concat(j.args, ", ")
+    end
+    if type(a) == "string" and #a > 140 then a = a:sub(1, 140) .. "..." end
+    local n = P.tlN + 1
+    if n > 8000 then
+        table.move(P.tl, 2001, 8000, 1)
+        for i = 6001, 8000 do P.tl[i] = nil end
+        n = 6001
+    end
+    P.tlN = n
+    P.tl[n] = { t = t, k = kind, p = j.path, m = j.method, a = a, o = j.stack and j.stack[1], id = j.id }
+end
+
+function P.Mark(text)
+    local L = P.app and P.app.LIVE
+    if not (L and L.on) then return false, "Live belum aktif (mulai dulu di tab Live)" end
+    text = clean((text and text ~= "") and text or "tandai")
+    L.emit("MRK", "=== " .. text .. " ===", nil, { text = text }, os.clock())
+    return true
+end
+
+local function stopWatch()
+    if P.watchConn then
+        pcall(function() P.watchConn:Disconnect() end)
+        P.watchConn = nil
+    end
+end
+
+local function startWatch(app)
+    stopWatch()
+    local L = app.LIVE
+    P.scrN = 0
+    P.watchConn = game.DescendantAdded:Connect(function(d)
+        if not P.cfg.newscripts or not L.on then return end
+        local okc, cls = pcall(function() return d.ClassName end)
+        if not okc or (cls ~= "LocalScript" and cls ~= "ModuleScript" and cls ~= "Script") then return end
+        if P.scrN >= 400 then return end
+        P.scrN += 1
+        local n = P.scrN
+        task.spawn(function()
+            task.wait(0.4 + (n % 10) * 0.15) -- disebar supaya tidak menumpuk saat banyak script muncul sekaligus
+            if not L.on or not P.alive or inCore(d) then return end
+            local okg, body = pcall(app.SRC.get, d)
+            if not okg or type(body) ~= "string" then body = nil end
+            local p = pathOf(d)
+            L.emit("SCR", ("%s  %s  %s"):format(cls, p, body and (#body .. "B") or "(decompile gagal)"), nil,
+                { path = p, class = cls, size = body and #body or nil }, os.clock())
+        end)
+    end)
+end
+
+local function patchLifecycle(app)
+    local L = app.LIVE
+    local oStart, oStop, oSave = L.start, L.stop, L.save
+    if type(oStart) ~= "function" or type(oStop) ~= "function" then return end
+    local wStart, wStop, wSave
+    wStart = function(...)
+        P.stk, P.stkN = {}, 0
+        P.tl, P.tlN = {}, 0
+        local r = oStart(...)
+        if L.on then pcall(startWatch, app) end
+        return r
+    end
+    wStop = function(...)
+        pcall(stopWatch)
+        return oStop(...)
+    end
+    L.start, L.stop = wStart, wStop
+    if type(oSave) == "function" then
+        wSave = function(...)
+            local r = oSave(...)
+            pcall(P.saveLive, app)
+            return r
+        end
+        L.save = wSave
+    end
+    if L.on then pcall(startWatch, app) end
+    P.patches[#P.patches + 1] = function()
+        if L.start == wStart then L.start = oStart end
+        if L.stop == wStop then L.stop = oStop end
+        if wSave and L.save == wSave then L.save = oSave end
+    end
+end
+
+-- dipanggil dari L.save (autosave v6 tiap 15 dtk + saat stop / teleport)
+function P.saveLive(app)
+    local L = app.LIVE
+    if not CAN_WRITE or next(L.rstat) == nil then return end
+    local rows = {}
+    for p, s in next, L.rstat do
+        if s.org then rows[#rows + 1] = { p, s } end
+    end
+    if #rows > 0 then
+        table.sort(rows, function(a, b) return a[2].out > b[2].out end)
+        local out = { "# asal panggilan (stack teratas) per remote OUT; sampel, bukan semua panggilan" }
+        for _, r in ipairs(rows) do
+            out[#out + 1] = ("%s  OUT=%d"):format(r[1], r[2].out)
+            for line, n in next, r[2].org do out[#out + 1] = ("    %s x%d"):format(line, n) end
+        end
+        save(("live_origins_%s.txt"):format(tostring(L.tag)), table.concat(out, "\n"))
+    end
+    local force = not L.on
+    local heavy = force or (os.clock() - P.lastHeavy >= 45)
+    if P.static then pcall(function() save("remote_protocol.md", P.protocol(app, P.static)) end) end
+    if heavy then
+        P.lastHeavy = os.clock()
+        if P.static then
+            pcall(function() save("remote_protocol.json", P.json(app, P.static)) end)
+            pcall(function()
+                local g = P.graph(app, P.static)
+                if g then save("remote_graph.mmd", g) end
+            end)
+        end
+        pcall(function()
+            local rep = P.MarkerReport(app)
+            if rep then save("marker_report.md", rep) end
+        end)
+    end
+end
+
+---------------------------------------------------------------------
+-- 3. analisis statis: protokol remote, graf, obfuscation
+---------------------------------------------------------------------
+local SENDM = { "FireServer", "InvokeServer" }
+
+-- nama remote dari RHS "local X = ....WaitForChild("Nama")" / ".Nama" / ["Nama"]
+local function aliasOf(rhs)
+    return rhs:match('WaitForChild%(%s*"([^"]+)"[^%)]*%)%s*$')
+        or rhs:match('FindFirstChild%(%s*"([^"]+)"[^%)]*%)%s*$')
+        or rhs:match('%["([^"]+)"%]%s*$')
+        or rhs:match("%.([%a_][%w_]*)%s*$")
+end
+
+local function resolve(ref, alias)
+    local lit = ref:match("[\"']([^\"']+)[\"']%)*%]*$")
+    if lit then return lit, true end
+    local last = ref:match("([%a_][%w_]*)$")
+    if not last then return ref, false end
+    local a = alias[last]
+    if a then return a, true end
+    return last, false
+end
+
+local function obfScore(body, nlines)
+    local s = #body > 150000 and body:sub(1, 150000) or body
+    local hex = cnt(s, "_0x%x%x%x%x")
+    local esc = cnt(s, "\\%d%d?%d?")
+    local conf = cnt(s, "[IlO][Il1O0][Il1O0][Il1O0][Il1O0][Il1O0]")
+    local chr = cnt(s, "string%.char%(") + cnt(s, "string%.byte%(")
+    local dyn = cnt(s, "loadstring") + cnt(s, "getfenv") + cnt(s, "setfenv")
+    local avg = math.floor(#body / math.max(nlines, 1))
+    local sc = hex + math.floor(esc / 8) + conf * 2 + chr
+    if avg > 300 then sc += 25 end
+    if dyn > 0 then sc += 10 end
+    return math.floor(sc), { hex = hex, esc = esc, conf = conf, chr = chr, dyn = dyn, avg = avg }
+end
+
+local function tidy(l)
+    if #l > 600 then return "(baris panjang)" end
+    return clean(l:match("^%s*(.-)%s*$") or l):sub(1, 140)
+end
+
+local function scanBody(s, body, sites, handlers, prof)
+    local p = pathOf(s)
+    local alias, s0, h0, nlines = {}, #sites + 1, #handlers + 1, 0
+    -- konteks: 2 baris sebelum + baris callsite + beberapa baris sesudah (maks 8 per script, 2500 total)
+    local prev1, prev2, curLine, pend, nctx = nil, nil, "", {}, 0
+    local function ctxOf(post)
+        if nctx >= 8 or P.ctxTotal >= 2500 then return nil end
+        nctx += 1
+        P.ctxTotal += 1
+        local pre = {}
+        if prev2 then pre[#pre + 1] = tidy(prev2) end
+        if prev1 then pre[#pre + 1] = tidy(prev1) end
+        local c = { pre = pre, post = {}, line = tidy(curLine) }
+        pend[#pend + 1] = { c = c, left = post }
+        return c
+    end
+    local function onLine(line, ln)
+        nlines = ln
+        if #line > 600 then return end
+        local av, rhs = line:match("^%s*local%s+([%a_][%w_]*)%s*=%s*(.+)$")
+        if av then
+            local nm = aliasOf(rhs)
+            if nm then
+                local cur = alias[av]
+                if cur == nil then alias[av] = nm elseif cur ~= nm then alias[av] = false end
+            end
+        end
+        for _, meth in ipairs(SENDM) do
+            local a, b = line:find(":" .. meth .. "(", 1, true)
+            if a and #sites < 30000 then
+                sites[#sites + 1] = {
+                    ref = line:sub(1, a - 1):match("([%w_%.%[%]\"'%(%)]+)$") or "?",
+                    meth = meth, args = clean(line:sub(b + 1, b + 160)), p = p, ln = ln, ctx = ctxOf(2),
+                }
+            end
+        end
+        local hr, params = line:match("([%w_%.%[%]\"']+)%.OnClientEvent:Connect%(function%(([^%)]*)%)")
+        if not hr then
+            hr, params = line:match("([%w_%.%[%]\"']+)%.OnClientInvoke%s*=%s*function%(([^%)]*)%)")
+        end
+        if hr and #handlers < 8000 then
+            handlers[#handlers + 1] = { ref = hr, params = params, p = p, ln = ln, ctx = ctxOf(3) }
+        end
+    end
+    lineIter(body, function(line, ln)
+        if pend[1] then
+            local tl = tidy(line)
+            for i = #pend, 1, -1 do
+                local pc = pend[i]
+                pc.c.post[#pc.c.post + 1] = tl
+                pc.left -= 1
+                if pc.left <= 0 then table.remove(pend, i) end
+            end
+        end
+        curLine = line
+        onLine(line, ln)
+        prev2, prev1 = prev1, line
+    end)
+    for i = s0, #sites do
+        local st = sites[i]
+        st.rname, st.res = resolve(st.ref, alias)
+    end
+    for i = h0, #handlers do
+        local h = handlers[i]
+        h.rname, h.res = resolve(h.ref, alias)
+    end
+    local score, d = obfScore(body, nlines)
+    prof[#prof + 1] = { p = p, score = score, d = d, size = #body, lines = nlines }
+end
+
+local function remoteRows(app)
+    local rows = {}
+    for _, r in ipairs(app.INDEX.remotes or {}) do
+        pcall(function()
+            local c = r.ClassName
+            if (c == "RemoteEvent" or c == "RemoteFunction" or c == "UnreliableRemoteEvent")
+                and not (app.gui and r:IsDescendantOf(app.gui)) and not inCore(r) then
+                rows[#rows + 1] = { r = r, p = pathOf(r), n = r.Name, c = c }
+            end
+        end)
+    end
+    table.sort(rows, function(a, b)
+        if a.n ~= b.n then return a.n < b.n end
+        return a.p < b.p
+    end)
+    return rows
+end
+
+local function md(x) return (tostring(x):gsub("`", "'"):gsub("%c", " ")) end
+
+local function ctxLines(c)
+    local out = {}
+    for _, l in ipairs(c.pre) do out[#out + 1] = l end
+    out[#out + 1] = c.line or ""
+    for _, l in ipairs(c.post) do out[#out + 1] = l end
+    return out
+end
+
+local function exLines(body, x)
+    body[#body + 1] = "  - `" .. md(x.t) .. "`"
+    if x.ctx then
+        body[#body + 1] = "    ```lua"
+        for _, l in ipairs(ctxLines(x.ctx)) do body[#body + 1] = "    " .. md(l) end
+        body[#body + 1] = "    ```"
+    end
+end
+
+-- ringkasan live: remote teramai + jumlah remote bising
+local function hotLines(L)
+    local rows = {}
+    for p, s in next, L.rstat do rows[#rows + 1] = { p = p, s = s, n = s.out + s.inn } end
+    if #rows == 0 then return "" end
+    table.sort(rows, function(a, b)
+        if a.n ~= b.n then return a.n > b.n end
+        return a.p < b.p
+    end)
+    local out = { "## Ringkasan live (teramai)", "" }
+    local noisy = 0
+    for _, r in ipairs(rows) do
+        if (r.s.peak or 0) >= 20 then noisy += 1 end
+    end
+    for i = 1, math.min(10, #rows) do
+        local r = rows[i]
+        out[#out + 1] = ("- `%s`  OUT=%d IN=%d puncak=%d/s%s"):format(md(r.p), r.s.out, r.s.inn, r.s.peak or 0,
+            (r.s.peak or 0) >= 20 and "  (bising: kandidat filter -exclude)" or "")
+    end
+    out[#out + 1] = ""
+    out[#out + 1] = ("Remote teramati: %d | puncak >= 20/dtk: %d"):format(#rows, noisy)
+    out[#out + 1] = ""
+    return table.concat(out, "\n") .. "\n"
+end
+
+-- dokumen protokol: statis (st boleh nil) + live (L.rstat)
+function P.protocol(app, st)
+    local L = app.LIVE
+    local sc, hn = {}, {}
+    if st then
+        for _, s in ipairs(st.sites) do
+            if s.rname then
+                local e = sc[s.rname]
+                if not e then
+                    e = { n = 0, ex = {} }
+                    sc[s.rname] = e
+                end
+                e.n += 1
+                if #e.ex < 3 then e.ex[#e.ex + 1] = { t = ("%s(%s) <- %s:%d"):format(s.meth, s.args:sub(1, 90), s.p, s.ln), ctx = s.ctx } end
+            end
+        end
+        for _, h in ipairs(st.handlers) do
+            if h.rname then
+                local e = hn[h.rname]
+                if not e then
+                    e = { n = 0, ex = {} }
+                    hn[h.rname] = e
+                end
+                e.n += 1
+                if #e.ex < 2 then e.ex[#e.ex + 1] = { t = ("function(%s) <- %s:%d"):format(h.params, h.p, h.ln), ctx = h.ctx } end
+            end
+        end
+    end
+    local rows = remoteRows(app)
+    local orphan = 0
+    local body = {}
+    for _, it in ipairs(rows) do
+        local s, e = sc[it.n], hn[it.n]
+        local ls = L.rstat[it.p] or L.rstat["[NIL] " .. it.p]
+        body[#body + 1] = ("## `%s` (%s)"):format(md(it.n), it.c)
+        body[#body + 1] = "- path: `" .. md(it.p) .. "`"
+        if s then
+            body[#body + 1] = ("- klien -> server (statis): %d callsite"):format(s.n)
+            for _, x in ipairs(s.ex) do exLines(body, x) end
+        end
+        if e then
+            body[#body + 1] = ("- server -> klien (statis): %d handler"):format(e.n)
+            for _, x in ipairs(e.ex) do exLines(body, x) end
+        end
+        if ls then
+            body[#body + 1] = ("- live: OUT %d / IN %d | puncak %d/s"):format(ls.out, ls.inn, ls.peak or 0)
+            local okp, pl = pcall(L.profLines, ls)
+            if okp and type(pl) == "table" then
+                for _, ln in ipairs(pl) do body[#body + 1] = "  - " .. md(ln) end
+            end
+            if ls.org then
+                for line, n in next, ls.org do body[#body + 1] = ("  - asal: `%s` x%d"):format(md(line), n) end
+            end
+        end
+        if not s and not e and not ls then
+            orphan += 1
+            body[#body + 1] = "- belum ada referensi statis maupun live (kemungkinan dipicu server / nama dinamis)"
+        end
+        body[#body + 1] = ""
+    end
+    local head = {
+        ("# Protokol remote | PlaceId %d | Dumper++ Plus v%s"):format(game.PlaceId, VERSION),
+        "",
+        ("Remote: %d | tanpa referensi: %d | analisis statis: %s"):format(#rows, orphan, st and "ya" or "belum dijalankan"),
+        "Sumber: callsite statis dari decompile + sampel panggilan live. Kosong = belum teramati, bukan berarti tidak ada.",
+        "",
+    }
+    return table.concat(head, "\n") .. "\n" .. hotLines(L) .. table.concat(body, "\n")
+end
+
+-- graf Mermaid: script --FireServer--> remote, remote --OnClient--> script
+function P.graph(app, st)
+    local L = app.LIVE
+    local known = {}
+    for _, it in ipairs(remoteRows(app)) do known[it.n] = true end
+    local ids, nid, nodes, agg, order = {}, 0, {}, {}, {}
+    local function node(key, lab, isRemote)
+        local id = ids[key]
+        if not id then
+            nid += 1
+            id = "n" .. nid
+            ids[key] = id
+            lab = (tostring(lab):gsub("[^%w_%-]", "_"))
+            nodes[id] = isRemote and ('  %s(["%s"])'):format(id, lab) or ('  %s["%s"]'):format(id, lab)
+        end
+        return id
+    end
+    local function edge(a, b, lab, c)
+        local k = a .. "\1" .. b .. "\1" .. lab
+        local e = agg[k]
+        if e then
+            e.n += c or 1
+        else
+            e = { a = a, b = b, lab = lab, n = c or 1 }
+            agg[k] = e
+            order[#order + 1] = e
+        end
+    end
+    for _, s in ipairs(st.sites) do
+        if s.rname and known[s.rname] then
+            edge(node("S" .. s.p, s.p:match("([^%.]+)$") or s.p, false), node("R" .. s.rname, s.rname, true), s.meth)
+        end
+    end
+    for _, h in ipairs(st.handlers) do
+        if h.rname and known[h.rname] then
+            edge(node("R" .. h.rname, h.rname, true), node("S" .. h.p, h.p:match("([^%.]+)$") or h.p, false), "OnClient")
+        end
+    end
+    -- sisi live: script asal (stack teratas) -> remote
+    for _, it in ipairs(remoteRows(app)) do
+        local ls = L.rstat[it.p] or L.rstat["[NIL] " .. it.p]
+        if ls and ls.org then
+            for line, n in next, ls.org do
+                local sp = line:match("^(.-):%d+") or line
+                edge(node("S" .. sp, sp:match("([^%.]+)$") or sp, false), node("R" .. it.n, it.n, true), "live", n)
+            end
+        end
+    end
+    if #order == 0 then return nil end
+    table.sort(order, function(x, y) return x.n > y.n end)
+    local used, edgeLines = {}, {}
+    for i, e in ipairs(order) do
+        if i > 800 then break end
+        used[e.a], used[e.b] = true, true
+        edgeLines[#edgeLines + 1] = ("  %s -->|%s x%d| %s"):format(e.a, e.lab, e.n, e.b)
+    end
+    local out = { "flowchart LR" }
+    for i = 1, nid do
+        local id = "n" .. i
+        if used[id] then out[#out + 1] = nodes[id] end
+    end
+    for _, l in ipairs(edgeLines) do out[#out + 1] = l end
+    out[#out + 1] = ("%%%% sisi %d dari %d"):format(#edgeLines, #order)
+    return table.concat(out, "\n")
+end
+
+-- seluruh protokol dalam JSON: statis + live + asal panggilan
+function P.json(app, st)
+    local L = app.LIVE
+    local sc, hn = {}, {}
+    local function add(map, name, item)
+        local e = map[name]
+        if not e then
+            e = { n = 0, ex = {} }
+            map[name] = e
+        end
+        e.n += 1
+        if #e.ex < 3 then e.ex[#e.ex + 1] = item end
+    end
+    if st then
+        for _, s in ipairs(st.sites) do
+            if s.rname then
+                add(sc, s.rname, {
+                    method = s.meth, args = s.args:sub(1, 120), script = s.p, line = s.ln, resolved = s.res and true or false,
+                    context = s.ctx and ctxLines(s.ctx) or nil,
+                })
+            end
+        end
+        for _, h in ipairs(st.handlers) do
+            if h.rname then
+                add(hn, h.rname, {
+                    params = h.params, script = h.p, line = h.ln, resolved = h.res and true or false,
+                    context = h.ctx and ctxLines(h.ctx) or nil,
+                })
+            end
+        end
+    end
+    local list = {}
+    for _, it in ipairs(remoteRows(app)) do
+        local obj = { name = it.n, class = it.c, path = it.p }
+        local s, h = sc[it.n], hn[it.n]
+        if s then obj.send = { count = s.n, examples = s.ex } end
+        if h then obj.receive = { count = h.n, examples = h.ex } end
+        local ls = L.rstat[it.p] or L.rstat["[NIL] " .. it.p]
+        if ls then
+            local live = { out = ls.out, inn = ls.inn, peak = ls.peak or 0 }
+            local okp, pl = pcall(L.profLines, ls)
+            if okp and type(pl) == "table" then live.args = pl end
+            if ls.org then
+                local o = {}
+                for line, n in next, ls.org do o[#o + 1] = { at = line, count = n } end
+                table.sort(o, function(x, y)
+                    if x.count ~= y.count then return x.count > y.count end
+                    return x.at < y.at
+                end)
+                live.origins = o
+            end
+            obj.live = live
+        end
+        list[#list + 1] = obj
+    end
+    return jenc({ place = game.PlaceId, plus = VERSION, remotes = list })
+end
+
+-- korelasi penanda -> remote (timeline live). window = detik setelah penanda (default cfg.corrWindow)
+function P.MarkerReport(app, window)
+    app = app or P.app
+    if not app then return nil, "Dumper++ v6 belum terdeteksi" end
+    window = tonumber(window) or P.cfg.corrWindow or 3
+    local tl, n = P.tl, P.tlN
+    local marks = {}
+    for i = 1, n do
+        if tl[i].k == "MRK" then marks[#marks + 1] = tl[i] end
+    end
+    if #marks == 0 then return nil, "belum ada penanda (Live aktif, lalu Tandai)" end
+    table.sort(marks, function(a, b) return a.t < b.t end)
+    if #marks > 200 then
+        local cut = {}
+        for i = #marks - 199, #marks do cut[#cut + 1] = marks[i] end
+        marks = cut
+    end
+    local epoch = (app.LIVE and app.LIVE.epoch) or 0
+    local out = {
+        ("# Korelasi penanda -> remote | jendela %.1f dtk | PlaceId %d | Dumper++ Plus v%s"):format(window, game.PlaceId, VERSION),
+        "",
+        "Sumber: sampel timeline live (setelah throttle v6). Remote yang konsisten muncul setelah penanda berlabel sama = kandidat kuat untuk aksi itu.",
+        "",
+    }
+    local seenIn, byText, textOrder = {}, {}, {}
+    for mi, m in ipairs(marks) do
+        local tEnd = m.t + window
+        local nxt = marks[mi + 1]
+        if nxt and nxt.t < tEnd then tEnd = nxt.t end
+        local agg, order = {}, {}
+        for i = 1, n do
+            local e = tl[i]
+            if (e.k == "OUT" or e.k == "IN ") and e.p and e.t >= m.t and e.t < tEnd then
+                local key = e.k .. "|" .. e.p .. "|" .. tostring(e.m)
+                local a = agg[key]
+                if not a then
+                    a = { key = key, k = e.k, p = e.p, m = e.m, n = 0, first = e.t - m.t, args = e.a, org = e.o }
+                    agg[key] = a
+                    order[#order + 1] = a
+                end
+                a.n += 1
+                if e.t - m.t < a.first then a.first = e.t - m.t end
+                if not a.org and e.o then a.org = e.o end
+            end
+        end
+        table.sort(order, function(x, y)
+            if x.first ~= y.first then return x.first < y.first end
+            return x.key < y.key
+        end)
+        local label = m.a or "tandai"
+        out[#out + 1] = ("## [%s] %s"):format(os.date("%H:%M:%S", math.floor(epoch + m.t)), md(label))
+        if #order == 0 then out[#out + 1] = "- tidak ada remote OUT/IN dalam jendela" end
+        for i, a in ipairs(order) do
+            if i > 25 then
+                out[#out + 1] = ("- ... %d lagi"):format(#order - 25)
+                break
+            end
+            out[#out + 1] = ("- +%.2fs  %s  `%s`%s x%d%s%s"):format(a.first, a.k, md(a.p), a.m and (" " .. md(a.m)) or "", a.n,
+                (a.args and a.args ~= "") and ("  args: `" .. md(a.args):sub(1, 100) .. "`") or "",
+                a.org and ("  asal: `" .. md(a.org) .. "`") or "")
+        end
+        out[#out + 1] = ""
+        local bt = byText[label]
+        if not bt then
+            bt = { n = 0, keys = {}, info = {} }
+            byText[label] = bt
+            textOrder[#textOrder + 1] = label
+        end
+        bt.n += 1
+        for _, a in ipairs(order) do
+            bt.keys[a.key] = (bt.keys[a.key] or 0) + 1
+            bt.info[a.key] = bt.info[a.key] or a
+            seenIn[a.key] = (seenIn[a.key] or 0) + 1
+        end
+    end
+    local any = false
+    for _, label in ipairs(textOrder) do
+        local bt = byText[label]
+        if bt.n >= 2 then
+            if not any then
+                out[#out + 1] = "# Konsistensi per label (penanda berlabel sama diulang)"
+                out[#out + 1] = ""
+                any = true
+            end
+            out[#out + 1] = ("## %s  (%d kali)"):format(md(label), bt.n)
+            local ks = {}
+            for key, c in next, bt.keys do ks[#ks + 1] = { key = key, c = c } end
+            table.sort(ks, function(x, y)
+                if x.c ~= y.c then return x.c > y.c end
+                return x.key < y.key
+            end)
+            for i, kv in ipairs(ks) do
+                if i > 15 then break end
+                local a = bt.info[kv.key]
+                local noisy = (#marks >= 4 and (seenIn[kv.key] or 0) >= 0.8 * #marks)
+                out[#out + 1] = ("- %d/%d  %s `%s`%s%s"):format(kv.c, bt.n, a.k, md(a.p), a.m and (" " .. md(a.m)) or "",
+                    noisy and "  (muncul di hampir semua penanda: kemungkinan bising)" or "")
+            end
+            out[#out + 1] = ""
+        end
+    end
+    return table.concat(out, "\n")
+end
+
+function P.Analyze(progress)
+    progress = progress or function() end
+    local app = P.app
+    if not app then return nil, "Dumper++ v6 belum terdeteksi" end
+    if not app.SCAN.done then return nil, "scan v6 belum selesai" end
+    if not CAN_WRITE then return nil, "executor tanpa writefile / makefolder" end
+    local scripts = collectScripts(app)
+    if #scripts == 0 then return nil, "tidak ada script terlihat" end
+
+    local sites, handlers, prof = {}, {}, {}
+    P.ctxTotal = 0
+    local total, nextI, finished, done, got = #scripts, 1, 0, 0, 0
+    local N = math.max(1, tonumber(app.CFG.DecompileWorkers) or 6)
+    local function worker()
+        while true do
+            local i = nextI
+            if i > total then return end
+            nextI = i + 1
+            local okp, body = pcall(app.SRC.get, scripts[i])
+            if okp and type(body) == "string" then
+                got += 1
+                pcall(scanBody, scripts[i], body, sites, handlers, prof)
+            end
+            finished += 1
+            if finished % 10 == 0 then progress(("analisis %d/%d"):format(finished, total)) end
+        end
+    end
+    for _ = 1, N do
+        task.spawn(function()
+            pcall(worker)
+            done += 1
+        end)
+    end
+    while done < N do task.wait(0.1) end
+
+    P.static = { sites = sites, handlers = handlers }
+    progress("menulis dokumen...")
+    save("remote_protocol.md", P.protocol(app, P.static))
+    pcall(function() save("remote_protocol.json", P.json(app, P.static)) end)
+    local g = P.graph(app, P.static)
+    if g then save("remote_graph.mmd", g) end
+
+    table.sort(prof, function(a, b)
+        if a.score ~= b.score then return a.score > b.score end
+        return a.p < b.p
+    end)
+    local out = {
+        "# peringkat kemungkinan obfuscation (heuristik dari hasil decompile; bukan bukti)",
+        "# score = _0xNNNN + escape desimal/8 + nama mirip I/l/O x2 + string.char/byte + 25 (baris sangat panjang) + 10 (loadstring/getfenv)",
+        "# >= 30 diberi tanda [OBF?]",
+    }
+    local nObf = 0
+    for i, r in ipairs(prof) do
+        if r.score >= 30 then nObf += 1 end
+        if i <= 300 and r.score >= 10 then
+            out[#out + 1] = ("%4d  hex=%d esc=%d conf=%d chr=%d dyn=%d avg=%d size=%d lines=%d  %s%s"):format(
+                r.score, r.d.hex, r.d.esc, r.d.conf, r.d.chr, r.d.dyn, r.d.avg, r.size, r.lines, r.p,
+                r.score >= 30 and "  [OBF?]" or "")
+        end
+    end
+    save("obfuscation.txt", table.concat(out, "\n"))
+    return { scripts = total, analyzed = got, sites = #sites, handlers = #handlers, obf = nObf, dir = P.dir }
+end
+
+---------------------------------------------------------------------
+-- 4. pencarian tambahan
+---------------------------------------------------------------------
+local SEARCH = {}
+
+SEARCH.src = function(app, q, limit)
+    local rePat = (q:sub(1, 3) == "re:") and q:sub(4) or nil
+    if rePat and (#rePat == 0 or not pcall(string.find, "", rePat)) then
+        return nil, "pola Lua tidak valid (re:...)"
+    end
+    local function hit(str)
+        if rePat then return str:find(rePat) ~= nil end
+        return str:lower():find(q, 1, true) ~= nil
+    end
+    local list = collectScripts(app)
+    if #list == 0 then return nil, "tidak ada script terlihat" end
+    local out, nextI, done = {}, 1, 0
+    local N = math.max(1, tonumber(app.CFG.DecompileWorkers) or 6)
+    local function worker()
+        while #out < limit do
+            local i = nextI
+            if i > #list then return end
+            nextI = i + 1
+            local s = list[i]
+            local okp, body = pcall(app.SRC.get, s)
+            if okp and type(body) == "string" and hit(body) then
+                local p = pathOf(s)
+                local hits = 0
+                lineIter(body, function(line, ln)
+                    if #line <= 2000 and hit(line) then
+                        hits += 1
+                        out[#out + 1] = { text = ("%s:%d  %s"):format(p, ln, clean((line:match("^%s*(.-)%s*$") or line):sub(1, 140))) }
+                        if hits >= 5 or #out >= limit then return true end
+                    end
+                end)
+            end
+        end
+    end
+    for _ = 1, N do
+        task.spawn(function()
+            pcall(worker)
+            done += 1
+        end)
+    end
+    while done < N do task.wait(0.1) end
+    while #out > limit do out[#out] = nil end
+    return out
+end
+
+SEARCH.attr = function(app, q, limit)
+    local out = {}
+    for i, inst in ipairs(app.INDEX.attrs or {}) do
+        if i % 300 == 0 then task.wait() end
+        local ok, a = pcall(inst.GetAttributes, inst)
+        if ok and type(a) == "table" then
+            for k, v in next, a do
+                local sv = tostring(v)
+                if tostring(k):lower():find(q, 1, true) or sv:lower():find(q, 1, true) then
+                    local okR, ref = pcall(luaRef, inst)
+                    out[#out + 1] = {
+                        text = ("%s  @%s = %s"):format(pathOf(inst), tostring(k), clean(sv):sub(1, 80)),
+                        copy = okR and ("%s:GetAttribute(%q)"):format(ref, tostring(k)) or nil,
+                    }
+                    if #out >= limit then return out end
+                end
+            end
+        end
+    end
+    return out
+end
+
+SEARCH.val = function(app, q, limit)
+    local out = {}
+    for i, v in ipairs(app.INDEX.values or {}) do
+        if i % 300 == 0 then task.wait() end
+        local ok, name, cls, val = pcall(function() return v.Name, v.ClassName, v.Value end)
+        if ok then
+            local sv = tostring(val)
+            if tostring(name):lower():find(q, 1, true) or sv:lower():find(q, 1, true) then
+                local okR, ref = pcall(luaRef, v)
+                out[#out + 1] = {
+                    text = ("%-14s %s = %s"):format(tostring(cls), pathOf(v), clean(sv):sub(1, 80)),
+                    copy = okR and ref or nil,
+                }
+                if #out >= limit then break end
+            end
+        end
+    end
+    return out
+end
+
+SEARCH.evt = function(app, q, limit)
+    if P.tlN == 0 then return nil, "riwayat live kosong (jalankan Live dulu)" end
+    local epoch = (app.LIVE and app.LIVE.epoch) or 0
+    local out = {}
+    for i = P.tlN, 1, -1 do
+        local e = P.tl[i]
+        local hay = ((e.p or "") .. " " .. (e.m or "") .. " " .. (e.a or "") .. " " .. (e.o or "")):lower()
+        if hay:find(q, 1, true) then
+            local stamp = os.date("%H:%M:%S", math.floor(epoch + e.t))
+            local text
+            if e.k == "MRK" then
+                text = ("%s === %s ==="):format(stamp, clean(e.a or ""))
+            else
+                text = ("%s %s %s%s(%s)%s"):format(stamp, e.k, clean(e.p or ""), e.m and (":" .. e.m) or "", clean(e.a or ""),
+                    e.o and ("  <- " .. clean(e.o)) or "")
+            end
+            out[#out + 1] = { text = text }
+            if #out >= limit then break end
+        end
+    end
+    return out
+end
+
+function P.Search(mode, q)
+    local app = P.app
+    if not app then return nil, "Dumper++ v6 belum terdeteksi" end
+    local f = SEARCH[mode]
+    if not f then return nil, "mode: src | attr | val | evt" end
+    q = tostring(q)
+    if not (mode == "src" and q:sub(1, 3) == "re:") then
+        if q:sub(1, 3) == "re:" then q = q:sub(4) end
+        q = q:lower()
+    end
+    return f(app, q, 150)
+end
+
+---------------------------------------------------------------------
+-- 5. UI (panel di dalam ScreenGui v6)
+---------------------------------------------------------------------
+local T = {
+    bg = Color3.fromRGB(16, 17, 23), panel = Color3.fromRGB(25, 27, 37), panel2 = Color3.fromRGB(36, 39, 52),
+    text = Color3.fromRGB(232, 234, 244), dim = Color3.fromRGB(140, 146, 165), off = Color3.fromRGB(58, 62, 78),
+    accent = Color3.fromRGB(90, 220, 140), blue = Color3.fromRGB(95, 160, 255), warn = Color3.fromRGB(245, 180, 80),
+    bad = Color3.fromRGB(235, 100, 110),
+}
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in next, props or {} do o[k] = v end
+    o.Parent = parent
+    return o
+end
+local function round(o, r) return new("UICorner", { CornerRadius = UDim.new(0, r or 6) }, o) end
+local function label(parent, txt, props)
+    local p = {
+        BackgroundTransparency = 1, Text = txt, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = false,
+    }
+    for k, v in next, props or {} do p[k] = v end
+    return new("TextLabel", p, parent)
+end
+local function btn(parent, txt, cb, props)
+    local p = {
+        Text = txt, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = T.text,
+        BackgroundColor3 = T.panel2, BorderSizePixel = 0, AutoButtonColor = true,
+    }
+    for k, v in next, props or {} do p[k] = v end
+    local b = new("TextButton", p, parent)
+    round(b)
+    b.Activated:Connect(function()
+        local ok, err = pcall(cb, b)
+        if not ok then warn("[Dumper++ Plus] ui: " .. tostring(err)) end
+    end)
+    return b
+end
+local function box(parent, placeholder, props)
+    local p = {
+        BackgroundColor3 = T.panel, TextColor3 = T.text, PlaceholderText = placeholder, PlaceholderColor3 = T.dim,
+        Text = "", Font = Enum.Font.Gotham, TextSize = 12, ClearTextOnFocus = false, BorderSizePixel = 0,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }
+    for k, v in next, props or {} do p[k] = v end
+    local b = new("TextBox", p, parent)
+    round(b)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 8) }, b)
+    return b
+end
+
+local function buildUI(app)
+    local t0 = os.clock()
+    while P.alive and P.app == app and not (app.gui and app.gui.Parent) and os.clock() - t0 < 180 do task.wait(0.25) end
+    if not (P.alive and P.app == app and app.gui and app.gui.Parent) then return end
+
+    local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
+    local WW, HH = math.min(360, vp.X - 20), math.min(560, vp.Y - 40)
+    local root = new("Frame", {
+        Name = "Plus", Size = UDim2.fromOffset(WW, HH), Position = UDim2.new(1, -WW - 12, 0, 48),
+        BackgroundColor3 = T.bg, BorderSizePixel = 0, ClipsDescendants = true, Active = true,
+    }, app.gui)
+    round(root, 10)
+    new("UIStroke", { Color = T.accent, Thickness = 1, Transparency = 0.5 }, root)
+    P.ui = root
+
+    local title = new("Frame", { Size = UDim2.new(1, 0, 0, 30), BackgroundColor3 = T.panel, BorderSizePixel = 0 }, root)
+    label(title, "Dumper++ Plus v" .. VERSION, {
+        Size = UDim2.new(1, -80, 1, 0), Position = UDim2.fromOffset(10, 0), Font = Enum.Font.GothamBold, TextSize = 13,
+    })
+    local body = new("Frame", { Size = UDim2.new(1, 0, 1, -30), Position = UDim2.fromOffset(0, 30), BackgroundTransparency = 1 }, root)
+    local collapsed = false
+    btn(title, "-", function()
+        collapsed = not collapsed
+        body.Visible = not collapsed
+        root.Size = collapsed and UDim2.fromOffset(WW, 30) or UDim2.fromOffset(WW, HH)
+    end, { Size = UDim2.fromOffset(26, 20), Position = UDim2.new(1, -62, 0.5, -10) })
+    btn(title, "x", function() P.Destroy() end, {
+        Size = UDim2.fromOffset(26, 20), Position = UDim2.new(1, -32, 0.5, -10), BackgroundColor3 = T.bad,
+    })
+
+    local dragging, dragStart, startPos
+    title.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, root.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    if UIS then
+        P.uiConns[#P.uiConns + 1] = UIS.InputChanged:Connect(function(i)
+            if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+                local d = i.Position - dragStart
+                root.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end)
+    end
+
+    local status = label(body, "siap", {
+        Size = UDim2.new(1, -16, 0, 20), Position = UDim2.new(0, 8, 1, -24), Font = Enum.Font.Code, TextSize = 11,
+    })
+    local function say(text, color)
+        status.Text = tostring(text)
+        status.TextColor3 = color or T.text
+    end
+    local function copy(text, okMsg)
+        if not ENV.setclipboard then
+            say("executor tanpa setclipboard", T.warn)
+            return
+        end
+        pcall(ENV.setclipboard, text)
+        say(okMsg or "disalin ke clipboard", T.accent)
+    end
+
+    -- toggle: stack trace + script baru
+    local function mkToggle(txt, key, x)
+        local b
+        local function paint()
+            local on = P.cfg[key]
+            b.Text = ("%s: %s"):format(txt, on and "ON" or "OFF")
+            b.BackgroundColor3 = on and T.accent or T.off
+            b.TextColor3 = on and T.bg or T.text
+        end
+        b = btn(body, "", function()
+            P.cfg[key] = not P.cfg[key]
+            paint()
+        end, { Size = UDim2.new(0.5, -11, 0, 26), Position = UDim2.new(x, x == 0 and 8 or 3, 0, 8) })
+        paint()
+    end
+    mkToggle("Stack trace", "trace", 0)
+    mkToggle("Script baru", "newscripts", 0.5)
+
+    -- penanda
+    local mbox = box(body, "penanda: mis. 'tekan serang', lalu Tandai", {
+        Size = UDim2.new(0.68, -8, 0, 28), Position = UDim2.fromOffset(8, 42),
+    })
+    btn(body, "Tandai", function()
+        local ok, msg = P.Mark(mbox.Text)
+        if ok then
+            say("penanda ditulis ke log live", T.accent)
+            mbox.Text = ""
+        else
+            say(msg or "gagal", T.warn)
+        end
+    end, { Size = UDim2.new(0.32, -8, 0, 28), Position = UDim2.new(0.68, 0, 0, 42), BackgroundColor3 = T.blue, TextColor3 = T.bg })
+
+    -- analisis penuh
+    local busy = false
+    btn(body, "ANALISIS PENUH (protokol + graf + obfuscation)", function(b)
+        if busy then return end
+        busy = true
+        local old = b.Text
+        b.Text = "menganalisis..."
+        task.spawn(function()
+            local ok, res, err = pcall(P.Analyze, function(t) say(t) end)
+            busy = false
+            b.Text = old
+            if not ok then
+                say("analisis gagal: " .. tostring(res), T.bad)
+            elseif not res then
+                say(tostring(err), T.warn)
+            else
+                say(("%d script | %d callsite | %d handler | obf? %d"):format(res.scripts, res.sites, res.handlers, res.obf), T.accent)
+                if res.dir then copy("workspace/" .. res.dir, nil) end
+            end
+        end)
+    end, { Size = UDim2.new(1, -16, 0, 30), Position = UDim2.fromOffset(8, 78), BackgroundColor3 = T.accent, TextColor3 = T.bg, Font = Enum.Font.GothamBold })
+
+    -- laporan penanda + reset timeline
+    btn(body, "Laporan penanda", function()
+        local rep, err = P.MarkerReport(app)
+        if not rep then
+            say(tostring(err), T.warn)
+            return
+        end
+        if CAN_WRITE then save("marker_report.md", rep) end
+        copy(rep, CAN_WRITE and "laporan tersimpan + disalin" or "laporan disalin")
+    end, { Size = UDim2.new(0.6, -11, 0, 28), Position = UDim2.fromOffset(8, 114), BackgroundColor3 = T.blue, TextColor3 = T.bg })
+    btn(body, "Reset timeline", function()
+        P.tl, P.tlN = {}, 0
+        say("timeline dikosongkan", T.accent)
+    end, { Size = UDim2.new(0.4, -11, 0, 28), Position = UDim2.new(0.6, 3, 0, 114) })
+
+    -- pencarian
+    local qbox = box(body, "cari (min 2 huruf). Source: re:pola | Live: riwayat remote", {
+        Size = UDim2.new(1, -16, 0, 28), Position = UDim2.fromOffset(8, 148),
+    })
+    local res = new("ScrollingFrame", {
+        Size = UDim2.new(1, -16, 1, -248), Position = UDim2.fromOffset(8, 216), BackgroundColor3 = T.panel, BorderSizePixel = 0,
+        ScrollBarThickness = 4, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, body)
+    round(res)
+    new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, res)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4), PaddingTop = UDim.new(0, 4) }, res)
+
+    local function render(list)
+        for _, c in ipairs(res:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
+        end
+        for i, r in ipairs(list) do
+            if i > 150 then break end
+            local row = new("TextButton", {
+                LayoutOrder = i, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1,
+                Text = r.text, TextColor3 = T.text, Font = Enum.Font.Code, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+                TextWrapped = true, AutoButtonColor = false, BorderSizePixel = 0,
+            }, res)
+            row.Activated:Connect(function()
+                copy(r.copy or r.text, r.copy and "kode disalin" or "baris disalin")
+            end)
+        end
+        res.CanvasPosition = Vector2.new(0, 0)
+    end
+
+    local function runSearch(mode)
+        if busy then return end
+        local raw = qbox.Text:match("^%s*(.-)%s*$")
+        if #raw < 2 then
+            say("isi minimal 2 huruf", T.warn)
+            return
+        end
+        if not app.SCAN.done then
+            say("scan v6 belum selesai", T.warn)
+            return
+        end
+        busy = true
+        say("mencari (" .. mode .. ")...")
+        task.spawn(function()
+            local ok, list, err = pcall(P.Search, mode, raw)
+            busy = false
+            if not ok then
+                say("pencarian gagal: " .. tostring(list), T.bad)
+            elseif not list then
+                say(tostring(err), T.warn)
+            else
+                render(list)
+                say(("%d hasil | tap baris = salin"):format(#list), T.accent)
+            end
+        end)
+    end
+    btn(body, "Source", function() runSearch("src") end, {
+        Size = UDim2.new(0.25, -7, 0, 28), Position = UDim2.new(0, 8, 0, 182), BackgroundColor3 = T.accent, TextColor3 = T.bg,
+    })
+    btn(body, "Attribute", function() runSearch("attr") end, {
+        Size = UDim2.new(0.25, -7, 0, 28), Position = UDim2.new(0.25, 5, 0, 182),
+    })
+    btn(body, "Live", function() runSearch("evt") end, {
+        Size = UDim2.new(0.25, -7, 0, 28), Position = UDim2.new(0.75, -1, 0, 182), BackgroundColor3 = T.warn, TextColor3 = T.bg,
+    })
+    btn(body, "Value", function() runSearch("val") end, {
+        Size = UDim2.new(0.25, -7, 0, 28), Position = UDim2.new(0.5, 2, 0, 182), BackgroundColor3 = T.blue, TextColor3 = T.bg,
+    })
+end
+
+---------------------------------------------------------------------
+-- 6. tempel / lepas (v6 ada di file yang sama, jadi langsung menempel ke APP tanpa watcher)
+---------------------------------------------------------------------
+local function detach()
+    for i = #P.patches, 1, -1 do pcall(P.patches[i]) end
+    P.patches = {}
+    pcall(stopWatch)
+    for _, c in ipairs(P.uiConns) do pcall(function() c:Disconnect() end) end
+    P.uiConns = {}
+    if P.ui then
+        pcall(function() P.ui:Destroy() end)
+        P.ui = nil
+    end
+    P.app, P.static, P.stk, P.stkN = nil, nil, {}, 0
+    P.tl, P.tlN = {}, 0
+end
+
+local function attach(app)
+    local L = app.LIVE
+    local need = { "hook", "emit", "start", "stop" }
+    for _, n in ipairs(need) do
+        if type(L[n]) ~= "function" then
+            warn("[Dumper++ Plus] struktur Dumper++ tidak cocok (L." .. n .. " tidak ada): add-on ini untuk v6")
+            return
+        end
+    end
+    if type(app.SRC) ~= "table" or type(app.SRC.get) ~= "function" or type(app.INDEX) ~= "table" or type(app.SCAN) ~= "table" then
+        warn("[Dumper++ Plus] struktur Dumper++ tidak cocok (SRC / INDEX / SCAN): add-on ini untuk v6")
+        return
+    end
+    P.app = app
+    P.dir = nil
+    P.skip = {}
+    if MYSRC then P.skip[MYSRC] = true end
+    pcall(patchHook, app)
+    pcall(patchEmit, app)
+    pcall(patchLifecycle, app)
+    task.spawn(buildUI, app)
+    print("[Dumper++ Plus] v" .. VERSION .. " menempel ke Dumper++ v6")
+end
+
+function P.Destroy()
+    P.alive = false
+    detach()
+    if ENV.DumperPP_Plus == P then ENV.DumperPP_Plus = nil end
+end
+
+-- v6 dibersihkan (Destroy / execute ulang) -> Plus ikut dilepas
+onCleanup(function() pcall(P.Destroy) end)
+
+local okA, errA = pcall(attach, APP)
+if not okA then warn("[Dumper++ Plus] gagal menempel: " .. tostring(errA)) end
+
+print("[Dumper++ Plus] v" .. VERSION .. " dimuat (tergabung dengan Dumper++ v6)")
+end)
+if not okPlus then
+    warn("[Dumper++ Plus] gagal dimuat, Dumper++ v6 tetap jalan: " .. tostring(errPlus))
+end
